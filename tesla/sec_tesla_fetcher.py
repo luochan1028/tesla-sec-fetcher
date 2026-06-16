@@ -72,13 +72,60 @@ def fetch_filing_content(url):
     return response.text
 
 
-def extract_text_from_html(html_content):
-    html_content = re.sub(r'<script[^>]*>.*?</script>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
-    html_content = re.sub(r'<style[^>]*>.*?</style>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<[^>]+>', ' ', html_content)
+def extract_key_financial_data(html_content):
+    """从财报中提取关键财务数据"""
+    text = re.sub(r'<script[^>]*>.*?</script>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<style[^>]*>.*?</style>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', ' ', text)
     text = html.unescape(text)
     text = re.sub(r'\s+', ' ', text).strip()
-    return text
+    
+    print(f"    文本总长度: {len(text)} 字符")
+    
+    # 关键财务术语和关键词
+    keyword_patterns = [
+        (r'(?:total\s+)?(?:revenues?|net\s+sales?)', '营收/收入'),
+        (r'(?:net\s+)?income[s]?', '净利润'),
+        (r'(?:gross\s+)?(?:profit|margin)', '毛利率/利润'),
+        (r'total\s+assets', '总资产'),
+        (r'total\s+liabilit', '总负债'),
+        (r'(?:stockholders?|shareholders?)\s+(?:equity|deficit)', '股东权益'),
+        (r'cash\s+(?:and\s+)?(?:cash\s+)?equivalents?', '现金及等价物'),
+        (r'operating\s+(?:expenses?|income|loss)', '运营费用/收入'),
+        (r'research\s+and\s+development', '研发费用'),
+        (r'earnings?\s+per\s+share', '每股收益'),
+        (r'automotive\s+(?:sales?|revenue)', '汽车业务营收'),
+        (r'energy\s+(?:generation|storage|segment)', '能源业务'),
+        (r'services?\s+revenue', '服务业务营收'),
+    ]
+    
+    # 在全文中搜索这些关键词的上下文
+    found_snippets = []
+    text_lower = text.lower()
+    
+    for pattern, chinese_label in keyword_patterns:
+        matches = [(m.start(), m.end()) for m in re.finditer(pattern, text_lower)]
+        for start, end in matches[:3]:  # 每个关键词取前3个
+            snippet_start = max(0, start - 50)
+            snippet_end = min(len(text), end + 150)
+            snippet = text[snippet_start:snippet_end]
+            # 清理多余空格
+            snippet = re.sub(r'\s+', ' ', snippet).strip()
+            found_snippets.append((chinese_label, snippet))
+    
+    print(f"    找到 {len(found_snippets)} 个财务相关片段")
+    
+    # 去重，合并相似内容
+    seen_snippets = set()
+    unique_snippets = []
+    for label, snippet in found_snippets:
+        # 用前50字符作为去重key
+        key = snippet[:80].strip()
+        if key not in seen_snippets and len(snippet) > 50:
+            seen_snippets.add(key)
+            unique_snippets.append((label, snippet))
+    
+    return unique_snippets[:30]  # 最多取30段
 
 
 def translate_chunk(text, retries=3):
@@ -105,28 +152,28 @@ def translate_chunk(text, retries=3):
     return None, "翻译失败"
 
 
-def translate_to_chinese(text):
-    chunks = []
-    chunk_size = 150
-    for i in range(0, len(text), chunk_size):
-        chunk = text[i:i+chunk_size].strip()
-        if chunk:
-            chunks.append(chunk)
-
-    chunks = chunks[:15]
-    print(f"    共 {len(chunks)} 段需要翻译")
-
-    translated_chunks = []
-    for i, chunk in enumerate(chunks):
-        print(f"    翻译第 {i+1}/{len(chunks)} 段...")
-        result, error = translate_chunk(chunk)
+def translate_financial_snippets(snippets):
+    """翻译财务数据片段"""
+    translated_pairs = []
+    
+    print(f"    开始翻译 {len(snippets)} 段财务数据...")
+    
+    for i, (label, original_text) in enumerate(snippets):
+        # 缩短片段，提高翻译质量
+        snippet = original_text[:200].strip()
+        
+        print(f"    翻译 [{label}] ({i+1}/{len(snippets)})...")
+        translated, error = translate_chunk(snippet)
+        
         if error:
-            translated_chunks.append(chunk)
+            print(f"      翻译失败，保留原文")
+            translated_pairs.append((label, snippet, snippet))
         else:
-            translated_chunks.append(result)
+            translated_pairs.append((label, snippet, translated))
+        
         time.sleep(random.uniform(3, 6))
-
-    return "\n".join(translated_chunks), None
+    
+    return translated_pairs
 
 
 def send_email(subject, content, recipient):
@@ -140,10 +187,9 @@ def send_email(subject, content, recipient):
 
     msg.attach(MIMEText(content, "plain", "utf-8"))
 
-    # 尝试不同端口和方式
     configs = [
-        (SMTP_SERVER, 587, "starttls"),
         (SMTP_SERVER, 25, "starttls"),
+        (SMTP_SERVER, 587, "starttls"),
         (SMTP_SERVER, 465, "ssl"),
     ]
     
@@ -186,44 +232,62 @@ def process_filing(filing):
 
     print(f"    下载中...")
     html_content = fetch_filing_content(filing["url"])
-    text_content = extract_text_from_html(html_content)
-    print(f"    提取文本完成 (长度: {len(text_content)}字符)")
-
-    if len(text_content) < 200:
-        print(f"    文本内容过少，可能格式异常")
+    
+    print(f"    提取关键财务数据...")
+    financial_snippets = extract_key_financial_data(html_content)
+    
+    if not financial_snippets:
+        print(f"    警告: 没有找到财务数据")
         return None
-
-    text_to_translate = text_content[:3000]
-
-    print(f"    翻译中 (英→中, 约{len(text_to_translate)}字符)...")
-    translated, error = translate_to_chinese(text_to_translate)
-
-    if error:
-        translated = text_content[:1500]
-
-    translated_file = os.path.join(OUTPUT_DIR, f"{filename_key}_translated.txt")
+    
+    print(f"    翻译财务数据...")
+    translated_pairs = translate_financial_snippets(financial_snippets)
+    
+    # 构建邮件内容
+    email_body = []
+    email_body.append(f"Tesla {form_name} ({filing['form']})")
+    email_body.append(f"提交日期: {date_cn}")
+    email_body.append(f"原文链接: {filing['url']}")
+    email_body.append("")
+    email_body.append("=" * 60)
+    email_body.append("关键财务数据摘要 (英译中):")
+    email_body.append("=" * 60)
+    email_body.append("")
+    
+    current_label = None
+    for i, (label, original, translated) in enumerate(translated_pairs):
+        if label != current_label:
+            email_body.append(f"\n【{label}】")
+            current_label = label
+        email_body.append(f"{i+1}. 原文: {original[:150]}")
+        email_body.append(f"   中文: {translated[:150]}")
+        email_body.append("")
+    
+    email_body.append("")
+    email_body.append("=" * 60)
+    email_body.append("注意: 这是机器翻译的财务数据摘要，请结合原文理解")
+    email_body.append(f"完整财报: {filing['url']}")
+    
+    email_content = "\n".join(email_body)
+    
+    # 保存原文
+    translated_file = os.path.join(OUTPUT_DIR, f"{filename_key}_financial_data.txt")
     with open(translated_file, "w", encoding="utf-8") as f:
-        f.write(translated)
-    print(f"    翻译结果已保存")
-
-    email_subject = f"[Tesla SEC] {form_name} {date_cn}"
-    email_content = f"""Tesla {form_name} ({filing['form']})
-提交日期: {date_cn}
-原文链接: {filing['url']}
-
-{translated}
-"""
-
+        f.write(email_content)
+    
+    email_subject = f"[Tesla SEC] {form_name} {date_cn} - 财务摘要"
+    
     print(f"    发送邮件至 {RECIPIENT}...")
     success, email_error = send_email(email_subject, email_content, RECIPIENT)
 
     if success:
+        print(f"    ✅ 邮件已发送")
         with open(marker_file, "w") as f:
             f.write(datetime.now().isoformat())
     else:
         print(f"    邮件发送失败: {email_error}")
 
-    return translated
+    return translated_pairs
 
 
 def check_new_filings():
