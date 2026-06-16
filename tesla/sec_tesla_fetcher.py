@@ -81,17 +81,21 @@ def extract_text_from_html(html_content):
 
 
 def translate_chunk(text, retries=3):
+    import urllib.parse
     url = "https://api.mymemory.translated.net/get"
-    params = {"q": text, "langpair": "en|zh-CN"}
-
+    encoded_text = urllib.parse.quote(text)
+    
     for attempt in range(retries):
         try:
-            resp = requests.get(url, params=params, timeout=30)
+            full_url = f"{url}?q={encoded_text}&langpair=en|zh-CN"
+            resp = requests.get(full_url, timeout=30)
             if resp.status_code == 200:
                 result = resp.json()
-                translated = result.get("responseData", {}).get("translatedText", "")
-                if translated:
-                    return translated, None
+                response_status = result.get("responseStatus", "200")
+                if response_status == "200":
+                    translated = result.get("responseData", {}).get("translatedText", "")
+                    if translated and translated != "NO QUERY SPECIFIED":
+                        return translated, None
             time.sleep(random.uniform(3, 8))
         except Exception as e:
             if attempt < retries - 1:
@@ -105,7 +109,7 @@ def translate_to_chinese(text):
     sentences = re.split(r'(?<=[.!?])\s+', text)
 
     for sent in sentences:
-        if len(current) + len(sent) > 400:
+        if len(current) + len(sent) > 300:
             if current:
                 chunks.append(current)
             current = sent
@@ -115,14 +119,14 @@ def translate_to_chinese(text):
     if current:
         chunks.append(current)
 
-    chunks = chunks[:15]
+    chunks = chunks[:10]
 
     translated_chunks = []
     for i, chunk in enumerate(chunks):
         print(f"    翻译第 {i+1}/{len(chunks)} 段...")
         result, error = translate_chunk(chunk)
         if error:
-            print(f"    警告: {error}")
+            print(f"    警告: {error}, 使用原文")
             translated_chunks.append(chunk)
         else:
             translated_chunks.append(result)
@@ -172,16 +176,14 @@ def process_filing(filing):
         print(f"    文本内容过少，可能格式异常")
         return None
 
-    text_to_translate = text_content[:8000]
+    text_to_translate = text_content[:6000]
 
     print(f"    翻译中 (英→中, 约{len(text_to_translate)}字符)...")
     translated, error = translate_to_chinese(text_to_translate)
 
     if error:
         print(f"    翻译失败: {error}")
-        with open(os.path.join(OUTPUT_DIR, f"{filename_key}_original.txt"), "w", encoding="utf-8") as f:
-            f.write(text_content)
-        return None
+        translated = text_content[:3000]
 
     translated_file = os.path.join(OUTPUT_DIR, f"{filename_key}_translated.txt")
     with open(translated_file, "w", encoding="utf-8") as f:
