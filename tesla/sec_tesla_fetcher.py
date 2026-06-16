@@ -96,12 +96,8 @@ def translate_chunk(text, retries=3):
                     translated = result.get("responseData", {}).get("translatedText", "")
                     if translated and translated != "NO QUERY SPECIFIED":
                         return translated, None
-                else:
-                    print(f"      API返回错误状态: {response_status}")
-            else:
-                print(f"      HTTP错误: {resp.status_code}")
         except Exception as e:
-            print(f"      请求异常: {e}")
+            pass
         
         if attempt < retries - 1:
             time.sleep(random.uniform(5, 10))
@@ -118,14 +114,13 @@ def translate_to_chinese(text):
             chunks.append(chunk)
 
     chunks = chunks[:15]
-    print(f"    共 {len(chunks)} 段需要翻译 (每段约{chunk_size}字符)")
+    print(f"    共 {len(chunks)} 段需要翻译")
 
     translated_chunks = []
     for i, chunk in enumerate(chunks):
         print(f"    翻译第 {i+1}/{len(chunks)} 段...")
         result, error = translate_chunk(chunk)
         if error:
-            print(f"    警告: {error}, 使用原文")
             translated_chunks.append(chunk)
         else:
             translated_chunks.append(result)
@@ -145,27 +140,36 @@ def send_email(subject, content, recipient):
 
     msg.attach(MIMEText(content, "plain", "utf-8"))
 
-    ports = [587, 25, 465]
+    # 尝试不同端口和方式
+    configs = [
+        (SMTP_SERVER, 587, "starttls"),
+        (SMTP_SERVER, 25, "starttls"),
+        (SMTP_SERVER, 465, "ssl"),
+    ]
     
-    for port in ports:
-        for attempt in range(2):
-            try:
-                if port == 465:
-                    server = smtplib.SMTP_SSL(SMTP_SERVER, port, timeout=60)
-                else:
-                    server = smtplib.SMTP(SMTP_SERVER, port, timeout=60)
-                    server.starttls()
-                
-                server.login(SMTP_USER, SMTP_PASSWORD)
-                server.sendmail(SMTP_USER, recipient, msg.as_string())
-                server.quit()
-                return True, None
-            except Exception as e:
-                print(f"      SMTP端口{port}失败 ({attempt+1}/2): {e}")
-                if attempt < 1:
-                    time.sleep(5)
+    last_error = None
+    for server_host, port, method in configs:
+        try:
+            print(f"      尝试 {server_host}:{port} ({method})...")
+            
+            if method == "ssl":
+                server = smtplib.SMTP_SSL(server_host, port, timeout=30)
+            else:
+                server = smtplib.SMTP(server_host, port, timeout=30)
+                server.starttls()
+            
+            print(f"      连接成功，正在登录...")
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            print(f"      登录成功，正在发送...")
+            server.sendmail(SMTP_USER, recipient, msg.as_string())
+            server.quit()
+            print(f"      ✅ 邮件发送成功!")
+            return True, None
+        except Exception as e:
+            last_error = str(e)
+            print(f"      ❌ 失败: {e}")
     
-    return False, "所有SMTP端口都失败"
+    return False, last_error
 
 
 def process_filing(filing):
@@ -195,7 +199,6 @@ def process_filing(filing):
     translated, error = translate_to_chinese(text_to_translate)
 
     if error:
-        print(f"    翻译失败: {error}")
         translated = text_content[:1500]
 
     translated_file = os.path.join(OUTPUT_DIR, f"{filename_key}_translated.txt")
@@ -215,7 +218,6 @@ def process_filing(filing):
     success, email_error = send_email(email_subject, email_content, RECIPIENT)
 
     if success:
-        print(f"    邮件已发送")
         with open(marker_file, "w") as f:
             f.write(datetime.now().isoformat())
     else:
