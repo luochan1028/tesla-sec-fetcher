@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Tesla SEC Financial Reports Fetcher
-定期抓取特斯拉财报、翻译成中文、发送到邮箱
+定期抓取特斯拉财报、提取关键财务数据、翻译成中文、发送到邮箱
 """
 
 import requests
@@ -23,7 +23,7 @@ SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.126.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-RECIPIENT = os.getenv("RECIPIENT", "luochan@126.com")
+RECIPIENT = os.getenv("RECIPIENT", "luochan1028@126.com")
 
 
 def get_recent_filings(forms=None, days_back=90):
@@ -80,52 +80,48 @@ def extract_key_financial_data(html_content):
     text = html.unescape(text)
     text = re.sub(r'\s+', ' ', text).strip()
     
-    print(f"    文本总长度: {len(text)} 字符")
-    
-    # 关键财务术语和关键词
+    # 关键财务术语模式
     keyword_patterns = [
-        (r'(?:total\s+)?(?:revenues?|net\s+sales?)', '营收/收入'),
-        (r'(?:net\s+)?income[s]?', '净利润'),
-        (r'(?:gross\s+)?(?:profit|margin)', '毛利率/利润'),
-        (r'total\s+assets', '总资产'),
-        (r'total\s+liabilit', '总负债'),
-        (r'(?:stockholders?|shareholders?)\s+(?:equity|deficit)', '股东权益'),
-        (r'cash\s+(?:and\s+)?(?:cash\s+)?equivalents?', '现金及等价物'),
-        (r'operating\s+(?:expenses?|income|loss)', '运营费用/收入'),
-        (r'research\s+and\s+development', '研发费用'),
-        (r'earnings?\s+per\s+share', '每股收益'),
-        (r'automotive\s+(?:sales?|revenue)', '汽车业务营收'),
-        (r'energy\s+(?:generation|storage|segment)', '能源业务'),
-        (r'services?\s+revenue', '服务业务营收'),
+        (r'(?:total\s+)?(?:revenues?|net\s+sales?)\s*[:\-]?\s*\$?\s*[\d,]+(?:\.\d+)?\s*(?:million|billion|thousand)?', '营收'),
+        (r'(?:net\s+)?income\s*(?:loss)?\s*[:\-]?\s*\$?\s*[\d,]+(?:\.\d+)?\s*(?:million|billion|thousand)?', '净利润'),
+        (r'(?:gross\s+(?:profit|margin))\s*[:\-]?\s*\$?\s*[\d,]+(?:\.\d+)?\s*(?:%|million|billion)?', '毛利润'),
+        (r'(?:gross\s+margin)\s*[:\-]?\s*[\d,]+(?:\.\d+)?\s*%', '毛利率'),
+        (r'(?:total\s+)?assets\s*[:\-]?\s*\$?\s*[\d,]+(?:\.\d+)?\s*(?:million|billion|thousand)?', '总资产'),
+        (r'(?:stockholders?|shareholders?)\s+(?:equity|deficit)\s*[:\-]?\s*\$?\s*[\d,]+(?:\.\d+)?\s*(?:million|billion|thousand)?', '股东权益'),
+        (r'cash\s+(?:and\s+)?(?:cash\s+)?equivalents?\s*[:\-]?\s*\$?\s*[\d,]+(?:\.\d+)?\s*(?:million|billion|thousand)?', '现金及等价物'),
+        (r'research\s+and\s+development\s*[:\-]?\s*\$?\s*[\d,]+(?:\.\d+)?\s*(?:million|billion|thousand)?', '研发费用'),
+        (r'(?:operating\s+(?:income|expenses?|loss))\s*[:\-]?\s*\$?\s*[\d,]+(?:\.\d+)?\s*(?:million|billion|thousand)?', '运营收入/支出'),
+        (r'(?:earnings?|net\s+income)\s+per\s+share\s*[:\-]?\s*\$?\s*[\d,]+(?:\.\d+)?', '每股收益'),
+        (r'(?:automotive|vehicle)\s+(?:sales?|revenue)\s*[:\-]?\s*\$?\s*[\d,]+(?:\.\d+)?\s*(?:million|billion|thousand)?', '汽车业务'),
+        (r'(?:energy|storage)\s+(?:revenue|generation|segment)\s*[:\-]?\s*\$?\s*[\d,]+(?:\.\d+)?\s*(?:million|billion|thousand)?', '能源业务'),
+        (r'services?\s+revenue\s*[:\-]?\s*\$?\s*[\d,]+(?:\.\d+)?\s*(?:million|billion|thousand)?', '服务业务'),
+        (r'(?:free\s+cash\s+flow)\s*[:\-]?\s*\$?\s*[\d,]+(?:\.\d+)?\s*(?:million|billion|thousand)?', '自由现金流'),
+        (r'(?:net\s+margin|profit\s+margin)\s*[:\-]?\s*[\d,]+(?:\.\d+)?\s*%', '净利率'),
+        (r'(?:return\s+on\s+(?:assets?|equity))\s*[:\-]?\s*[\d,]+(?:\.\d+)?\s*%', '资产/权益回报率'),
     ]
     
-    # 在全文中搜索这些关键词的上下文
     found_snippets = []
     text_lower = text.lower()
     
-    for pattern, chinese_label in keyword_patterns:
-        matches = [(m.start(), m.end()) for m in re.finditer(pattern, text_lower)]
-        for start, end in matches[:3]:  # 每个关键词取前3个
-            snippet_start = max(0, start - 50)
-            snippet_end = min(len(text), end + 150)
-            snippet = text[snippet_start:snippet_end]
-            # 清理多余空格
-            snippet = re.sub(r'\s+', ' ', snippet).strip()
-            found_snippets.append((chinese_label, snippet))
+    for pattern, label in keyword_patterns:
+        matches = [(m.start(), m.end()) for m in re.finditer(pattern, text_lower, re.IGNORECASE)]
+        for start, end in matches[:5]:
+            snippet_start = max(0, start - 30)
+            snippet_end = min(len(text), end + 100)
+            snippet = re.sub(r'\s+', ' ', text[snippet_start:snippet_end]).strip()
+            if len(snippet) > 20:
+                found_snippets.append((label, snippet))
     
-    print(f"    找到 {len(found_snippets)} 个财务相关片段")
-    
-    # 去重，合并相似内容
-    seen_snippets = set()
-    unique_snippets = []
+    # 去重
+    seen = set()
+    unique = []
     for label, snippet in found_snippets:
-        # 用前50字符作为去重key
-        key = snippet[:80].strip()
-        if key not in seen_snippets and len(snippet) > 50:
-            seen_snippets.add(key)
-            unique_snippets.append((label, snippet))
+        key = snippet[:60]
+        if key not in seen:
+            seen.add(key)
+            unique.append((label, snippet))
     
-    return unique_snippets[:30]  # 最多取30段
+    return unique[:25]
 
 
 def translate_chunk(text, retries=3):
@@ -138,42 +134,43 @@ def translate_chunk(text, retries=3):
             resp = requests.get(full_url, timeout=30)
             if resp.status_code == 200:
                 result = resp.json()
-                response_status = result.get("responseStatus", 200)
-                if response_status == 200:
+                if result.get("responseStatus") == 200:
                     translated = result.get("responseData", {}).get("translatedText", "")
                     if translated and translated != "NO QUERY SPECIFIED":
-                        return translated, None
-        except Exception as e:
+                        return translated
+        except:
             pass
-        
         if attempt < retries - 1:
-            time.sleep(random.uniform(5, 10))
-    
-    return None, "翻译失败"
+            time.sleep(random.uniform(3, 7))
+    return None
 
 
-def translate_financial_snippets(snippets):
-    """翻译财务数据片段"""
-    translated_pairs = []
-    
-    print(f"    开始翻译 {len(snippets)} 段财务数据...")
-    
-    for i, (label, original_text) in enumerate(snippets):
-        # 缩短片段，提高翻译质量
-        snippet = original_text[:200].strip()
-        
-        print(f"    翻译 [{label}] ({i+1}/{len(snippets)})...")
-        translated, error = translate_chunk(snippet)
-        
-        if error:
-            print(f"      翻译失败，保留原文")
-            translated_pairs.append((label, snippet, snippet))
+def translate_to_chinese(text):
+    # 分段翻译，每段单独翻再组合
+    sentences = re.split(r'(?<=[.;])\s+', text)
+    chunks = []
+    current = ""
+    for s in sentences:
+        if len(current) + len(s) > 180:
+            if current:
+                chunks.append(current)
+            current = s
         else:
-            translated_pairs.append((label, snippet, translated))
-        
-        time.sleep(random.uniform(3, 6))
+            current = (current + " " + s).strip()
+    if current:
+        chunks.append(current)
     
-    return translated_pairs
+    chunks = chunks[:8]
+    translated_parts = []
+    
+    for i, chunk in enumerate(chunks):
+        print(f"    翻译第 {i+1}/{len(chunks)} 段...")
+        t = translate_chunk(chunk)
+        if t:
+            translated_parts.append(t)
+        time.sleep(random.uniform(2, 5))
+    
+    return " ".join(translated_parts) if translated_parts else text
 
 
 def send_email(subject, content, recipient):
@@ -184,37 +181,23 @@ def send_email(subject, content, recipient):
     msg["Subject"] = subject
     msg["From"] = SMTP_USER
     msg["To"] = recipient
-
     msg.attach(MIMEText(content, "plain", "utf-8"))
 
-    configs = [
-        (SMTP_SERVER, 25, "starttls"),
-        (SMTP_SERVER, 587, "starttls"),
-        (SMTP_SERVER, 465, "ssl"),
-    ]
+    configs = [(SMTP_SERVER, 25, "starttls"), (SMTP_SERVER, 587, "starttls"), (SMTP_SERVER, 465, "ssl")]
     
-    last_error = None
     for server_host, port, method in configs:
         try:
-            print(f"      尝试 {server_host}:{port} ({method})...")
-            
             if method == "ssl":
                 server = smtplib.SMTP_SSL(server_host, port, timeout=30)
             else:
                 server = smtplib.SMTP(server_host, port, timeout=30)
                 server.starttls()
-            
-            print(f"      连接成功，正在登录...")
             server.login(SMTP_USER, SMTP_PASSWORD)
-            print(f"      登录成功，正在发送...")
             server.sendmail(SMTP_USER, recipient, msg.as_string())
             server.quit()
-            print(f"      ✅ 邮件发送成功!")
             return True, None
         except Exception as e:
             last_error = str(e)
-            print(f"      ❌ 失败: {e}")
-    
     return False, last_error
 
 
@@ -234,69 +217,71 @@ def process_filing(filing):
     html_content = fetch_filing_content(filing["url"])
     
     print(f"    提取关键财务数据...")
-    financial_snippets = extract_key_financial_data(html_content)
+    snippets = extract_key_financial_data(html_content)
+    print(f"    找到 {len(snippets)} 条财务数据")
     
-    if not financial_snippets:
+    if not snippets:
         print(f"    警告: 没有找到财务数据")
         return None
     
-    print(f"    翻译财务数据...")
-    translated_pairs = translate_financial_snippets(financial_snippets)
+    # 只保留中文翻译
+    email_lines = [
+        f"Tesla {form_name} 财务摘要",
+        f"报告期: {date_cn}",
+        f"原文: {filing['url']}",
+        "",
+        "=" * 50,
+        "【关键财务数据】",
+        "=" * 50,
+        "",
+    ]
     
-    # 构建邮件内容
-    email_body = []
-    email_body.append(f"Tesla {form_name} ({filing['form']})")
-    email_body.append(f"提交日期: {date_cn}")
-    email_body.append(f"原文链接: {filing['url']}")
-    email_body.append("")
-    email_body.append("=" * 60)
-    email_body.append("关键财务数据摘要 (英译中):")
-    email_body.append("=" * 60)
-    email_body.append("")
+    for i, (label, original) in enumerate(snippets):
+        print(f"    翻译 [{label}] ({i+1}/{len(snippets)})...")
+        chinese = translate_to_chinese(original)
+        if chinese and len(chinese) > 5:
+            email_lines.append(f"• {label}: {chinese}")
+        else:
+            # 翻译失败则跳过，不用英文
+            pass
+        time.sleep(random.uniform(1, 3))
     
-    current_label = None
-    for i, (label, original, translated) in enumerate(translated_pairs):
-        if label != current_label:
-            email_body.append(f"\n【{label}】")
-            current_label = label
-        email_body.append(f"{i+1}. 原文: {original[:150]}")
-        email_body.append(f"   中文: {translated[:150]}")
-        email_body.append("")
+    email_lines.extend([
+        "",
+        "=" * 50,
+        f"完整报告: {filing['url']}",
+        "（以上为机器翻译，仅供参考）",
+    ])
     
-    email_body.append("")
-    email_body.append("=" * 60)
-    email_body.append("注意: 这是机器翻译的财务数据摘要，请结合原文理解")
-    email_body.append(f"完整财报: {filing['url']}")
+    email_content = "\n".join(email_lines)
     
-    email_content = "\n".join(email_body)
-    
-    # 保存原文
-    translated_file = os.path.join(OUTPUT_DIR, f"{filename_key}_financial_data.txt")
+    # 保存
+    translated_file = os.path.join(OUTPUT_DIR, f"{filename_key}_zh.txt")
     with open(translated_file, "w", encoding="utf-8") as f:
         f.write(email_content)
     
-    email_subject = f"[Tesla SEC] {form_name} {date_cn} - 财务摘要"
+    email_subject = f"【Tesla】{form_name} {date_cn} 财务摘要"
     
     print(f"    发送邮件至 {RECIPIENT}...")
-    success, email_error = send_email(email_subject, email_content, RECIPIENT)
+    success, error = send_email(email_subject, email_content, RECIPIENT)
 
     if success:
         print(f"    ✅ 邮件已发送")
         with open(marker_file, "w") as f:
             f.write(datetime.now().isoformat())
     else:
-        print(f"    邮件发送失败: {email_error}")
+        print(f"    邮件发送失败: {error}")
 
-    return translated_pairs
+    return email_content
 
 
 def check_new_filings():
-    print(f"[{datetime.now().isoformat()}] 检查 Tesla (TSLA) 最新 SEC 文件...")
+    print(f"[{datetime.now().isoformat()}] 检查 Tesla 最新 SEC 文件...")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     try:
         filings = get_recent_filings(forms=["10-K", "10-Q"], days_back=90)
-        print(f"找到 {len(filings)} 个最近财报 (10-K, 10-Q)")
+        print(f"找到 {len(filings)} 个财报")
 
         for filing in filings:
             process_filing(filing)
