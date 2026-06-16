@@ -11,6 +11,7 @@ import smtplib
 import html
 import time
 import random
+import urllib.parse
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
@@ -81,18 +82,17 @@ def extract_text_from_html(html_content):
 
 
 def translate_chunk(text, retries=3):
-    import urllib.parse
     url = "https://api.mymemory.translated.net/get"
     encoded_text = urllib.parse.quote(text)
-    
+    full_url = f"{url}?q={encoded_text}&langpair=en|zh-CN"
+
     for attempt in range(retries):
         try:
-            full_url = f"{url}?q={encoded_text}&langpair=en|zh-CN"
             resp = requests.get(full_url, timeout=30)
             if resp.status_code == 200:
                 result = resp.json()
-                response_status = result.get("responseStatus", "200")
-                if response_status == "200":
+                response_status = result.get("responseStatus", 200)
+                if response_status == 200:
                     translated = result.get("responseData", {}).get("translatedText", "")
                     if translated and translated != "NO QUERY SPECIFIED":
                         return translated, None
@@ -147,10 +147,11 @@ def send_email(subject, content, recipient):
     msg.attach(MIMEText(content, "plain", "utf-8"))
 
     try:
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(SMTP_USER, recipient, msg.as_string())
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=30)
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.sendmail(SMTP_USER, recipient, msg.as_string())
+        server.quit()
         return True, None
     except Exception as e:
         return False, str(e)
