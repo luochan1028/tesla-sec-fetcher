@@ -81,70 +81,57 @@ def extract_text_from_html(html_content):
     return text
 
 
-def translate_chunk(text, retries=5):
+def translate_chunk(text, retries=3):
     url = "https://api.mymemory.translated.net/get"
     encoded_text = urllib.parse.quote(text)
     full_url = f"{url}?q={encoded_text}&langpair=en|zh-CN"
 
     for attempt in range(retries):
         try:
-            resp = requests.get(full_url, timeout=45)
+            resp = requests.get(full_url, timeout=30)
             if resp.status_code == 200:
                 result = resp.json()
                 response_status = result.get("responseStatus", 200)
                 if response_status == 200:
                     translated = result.get("responseData", {}).get("translatedText", "")
                     if translated and translated != "NO QUERY SPECIFIED":
-                        print(f"      翻译成功 (长度: {len(translated)})")
                         return translated, None
-                    else:
-                        print(f"      翻译结果为空: {result}")
                 else:
                     print(f"      API返回错误状态: {response_status}")
             else:
                 print(f"      HTTP错误: {resp.status_code}")
         except Exception as e:
-            print(f"      请求异常 ({attempt+1}/{retries}): {e}")
+            print(f"      请求异常: {e}")
         
         if attempt < retries - 1:
-            wait_time = random.uniform(5, 15)
-            print(f"      等待 {wait_time:.1f}秒后重试...")
-            time.sleep(wait_time)
+            time.sleep(random.uniform(5, 10))
     
     return None, "翻译失败"
 
 
 def translate_to_chinese(text):
     chunks = []
-    current = ""
-    sentences = re.split(r'(?<=[.!?])\s+', text)
+    chunk_size = 150
+    for i in range(0, len(text), chunk_size):
+        chunk = text[i:i+chunk_size].strip()
+        if chunk:
+            chunks.append(chunk)
 
-    for sent in sentences:
-        if len(current) + len(sent) > 300:
-            if current:
-                chunks.append(current)
-            current = sent
-        else:
-            current = (current + " " + sent).strip()
-
-    if current:
-        chunks.append(current)
-
-    chunks = chunks[:10]
-    print(f"    共 {len(chunks)} 段需要翻译")
+    chunks = chunks[:15]
+    print(f"    共 {len(chunks)} 段需要翻译 (每段约{chunk_size}字符)")
 
     translated_chunks = []
     for i, chunk in enumerate(chunks):
-        print(f"    翻译第 {i+1}/{len(chunks)} 段 (长度: {len(chunk)})...")
+        print(f"    翻译第 {i+1}/{len(chunks)} 段...")
         result, error = translate_chunk(chunk)
         if error:
             print(f"    警告: {error}, 使用原文")
             translated_chunks.append(chunk)
         else:
             translated_chunks.append(result)
-        time.sleep(random.uniform(3, 8))
+        time.sleep(random.uniform(3, 6))
 
-    return "\n\n".join(translated_chunks), None
+    return "\n".join(translated_chunks), None
 
 
 def send_email(subject, content, recipient):
@@ -158,20 +145,27 @@ def send_email(subject, content, recipient):
 
     msg.attach(MIMEText(content, "plain", "utf-8"))
 
-    for attempt in range(3):
-        try:
-            server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=60)
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(SMTP_USER, recipient, msg.as_string())
-            server.quit()
-            return True, None
-        except Exception as e:
-            print(f"      邮件发送失败 ({attempt+1}/3): {e}")
-            if attempt < 2:
-                time.sleep(10)
+    ports = [587, 25, 465]
     
-    return False, str(e)
+    for port in ports:
+        for attempt in range(2):
+            try:
+                if port == 465:
+                    server = smtplib.SMTP_SSL(SMTP_SERVER, port, timeout=60)
+                else:
+                    server = smtplib.SMTP(SMTP_SERVER, port, timeout=60)
+                    server.starttls()
+                
+                server.login(SMTP_USER, SMTP_PASSWORD)
+                server.sendmail(SMTP_USER, recipient, msg.as_string())
+                server.quit()
+                return True, None
+            except Exception as e:
+                print(f"      SMTP端口{port}失败 ({attempt+1}/2): {e}")
+                if attempt < 1:
+                    time.sleep(5)
+    
+    return False, "所有SMTP端口都失败"
 
 
 def process_filing(filing):
@@ -195,21 +189,21 @@ def process_filing(filing):
         print(f"    文本内容过少，可能格式异常")
         return None
 
-    text_to_translate = text_content[:6000]
+    text_to_translate = text_content[:3000]
 
     print(f"    翻译中 (英→中, 约{len(text_to_translate)}字符)...")
     translated, error = translate_to_chinese(text_to_translate)
 
     if error:
         print(f"    翻译失败: {error}")
-        translated = text_content[:3000]
+        translated = text_content[:1500]
 
     translated_file = os.path.join(OUTPUT_DIR, f"{filename_key}_translated.txt")
     with open(translated_file, "w", encoding="utf-8") as f:
         f.write(translated)
     print(f"    翻译结果已保存")
 
-    email_subject = f"[Tesla SEC] {form_name} {date_cn} - 翻译版"
+    email_subject = f"[Tesla SEC] {form_name} {date_cn}"
     email_content = f"""Tesla {form_name} ({filing['form']})
 提交日期: {date_cn}
 原文链接: {filing['url']}
