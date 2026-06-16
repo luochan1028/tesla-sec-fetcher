@@ -81,25 +81,36 @@ def extract_text_from_html(html_content):
     return text
 
 
-def translate_chunk(text, retries=3):
+def translate_chunk(text, retries=5):
     url = "https://api.mymemory.translated.net/get"
     encoded_text = urllib.parse.quote(text)
     full_url = f"{url}?q={encoded_text}&langpair=en|zh-CN"
 
     for attempt in range(retries):
         try:
-            resp = requests.get(full_url, timeout=30)
+            resp = requests.get(full_url, timeout=45)
             if resp.status_code == 200:
                 result = resp.json()
                 response_status = result.get("responseStatus", 200)
                 if response_status == 200:
                     translated = result.get("responseData", {}).get("translatedText", "")
                     if translated and translated != "NO QUERY SPECIFIED":
+                        print(f"      翻译成功 (长度: {len(translated)})")
                         return translated, None
-            time.sleep(random.uniform(3, 8))
+                    else:
+                        print(f"      翻译结果为空: {result}")
+                else:
+                    print(f"      API返回错误状态: {response_status}")
+            else:
+                print(f"      HTTP错误: {resp.status_code}")
         except Exception as e:
-            if attempt < retries - 1:
-                time.sleep(random.uniform(5, 12))
+            print(f"      请求异常 ({attempt+1}/{retries}): {e}")
+        
+        if attempt < retries - 1:
+            wait_time = random.uniform(5, 15)
+            print(f"      等待 {wait_time:.1f}秒后重试...")
+            time.sleep(wait_time)
+    
     return None, "翻译失败"
 
 
@@ -120,17 +131,18 @@ def translate_to_chinese(text):
         chunks.append(current)
 
     chunks = chunks[:10]
+    print(f"    共 {len(chunks)} 段需要翻译")
 
     translated_chunks = []
     for i, chunk in enumerate(chunks):
-        print(f"    翻译第 {i+1}/{len(chunks)} 段...")
+        print(f"    翻译第 {i+1}/{len(chunks)} 段 (长度: {len(chunk)})...")
         result, error = translate_chunk(chunk)
         if error:
             print(f"    警告: {error}, 使用原文")
             translated_chunks.append(chunk)
         else:
             translated_chunks.append(result)
-        time.sleep(random.uniform(2, 5))
+        time.sleep(random.uniform(3, 8))
 
     return "\n\n".join(translated_chunks), None
 
@@ -146,15 +158,20 @@ def send_email(subject, content, recipient):
 
     msg.attach(MIMEText(content, "plain", "utf-8"))
 
-    try:
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=30)
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.sendmail(SMTP_USER, recipient, msg.as_string())
-        server.quit()
-        return True, None
-    except Exception as e:
-        return False, str(e)
+    for attempt in range(3):
+        try:
+            server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=60)
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(SMTP_USER, recipient, msg.as_string())
+            server.quit()
+            return True, None
+        except Exception as e:
+            print(f"      邮件发送失败 ({attempt+1}/3): {e}")
+            if attempt < 2:
+                time.sleep(10)
+    
+    return False, str(e)
 
 
 def process_filing(filing):
@@ -172,6 +189,7 @@ def process_filing(filing):
     print(f"    下载中...")
     html_content = fetch_filing_content(filing["url"])
     text_content = extract_text_from_html(html_content)
+    print(f"    提取文本完成 (长度: {len(text_content)}字符)")
 
     if len(text_content) < 200:
         print(f"    文本内容过少，可能格式异常")
@@ -189,6 +207,7 @@ def process_filing(filing):
     translated_file = os.path.join(OUTPUT_DIR, f"{filename_key}_translated.txt")
     with open(translated_file, "w", encoding="utf-8") as f:
         f.write(translated)
+    print(f"    翻译结果已保存")
 
     email_subject = f"[Tesla SEC] {form_name} {date_cn} - 翻译版"
     email_content = f"""Tesla {form_name} ({filing['form']})
