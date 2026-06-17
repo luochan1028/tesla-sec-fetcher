@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Tesla SEC Financial Reports Analyzer
-使用SEC API直接提取财务数据，生成分析报告
+Multi-Company SEC Financial Reports Analyzer
+多公司财报分析：Tesla, NVIDIA, TSMC, Microsoft, Micron, Broadcom, Apple, AMD, Intel, Meta, Google, Amazon
 """
 
 import requests
@@ -10,7 +10,6 @@ import smtplib
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta
 
-CIK = "0001318605"
 OUTPUT_DIR = "sec_filings"
 
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.126.com")
@@ -18,421 +17,348 @@ SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 RECIPIENT = os.getenv("RECIPIENT", "luochan1028@126.com")
 
+# 公司配置: (中文名, CIK, 报告类型)
+COMPANIES = [
+    ("Tesla 特斯拉", "0001318605", ["10-K", "10-Q"]),
+    ("NVIDIA 英伟达", "0001045810", ["10-K", "10-Q"]),
+    ("Microsoft 微软", "0000789019", ["10-K", "10-Q"]),
+    ("Apple 苹果", "0000320193", ["10-K", "10-Q"]),
+    ("Micron 美光", "0000723125", ["10-K", "10-Q"]),
+    ("Broadcom 博通", "0001730168", ["10-K", "10-Q"]),
+    ("AMD 超威半导体", "0000002488", ["10-K", "10-Q"]),
+    ("Intel 英特尔", "0000050863", ["10-K", "10-Q"]),
+    ("Meta Platforms", "0001326801", ["10-K", "10-Q"]),
+    ("Alphabet 谷歌", "0001652044", ["10-K", "10-Q"]),
+    ("Amazon 亚马逊", "0001018724", ["10-K", "10-Q"]),
+    ("TSMC 台积电", "0001158449", ["20-F"]),
+]
 
-def get_sec_xbrl_data():
-    """从SEC获取Tesla的结构化财务数据(XBRL)"""
-    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{CIK}.json"
-    headers = {"User-Agent": "TeslaFetcher/1.0 (contact@example.com)"}
-    response = requests.get(url, headers=headers, timeout=30)
-    return response.json()
+REVENUE_CONCEPTS = [
+    "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "SalesRevenueNet", "Revenue", "TotalRevenuesAndOtherIncome",
+    "RevenueFromContractWithCustomerIncludingAssessedTax", "ContractWithCustomerRevenue"
+]
+NET_INCOME_CONCEPTS = [
+    "NetIncomeLoss", "NetIncomeLossAvailableToCommonStockholders", "ProfitLoss", "NetIncome"
+]
+GROSS_PROFIT_CONCEPTS = ["GrossProfit", "GrossMargin"]
+RD_CONCEPTS = ["ResearchAndDevelopmentExpense", "ResearchDevelopmentAndRelatedExpense"]
+CASH_CONCEPTS = ["CashAndCashEquivalentsAtCarryingValue", "CashAndCashEquivalents", "Cash"]
+ASSETS_CONCEPTS = ["Assets"]
+EQUITY_CONCEPTS = ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"]
+EPS_CONCEPTS = ["EarningsPerShareBasic", "EarningsPerShareBasicAndDiluted", "IncomeLossAvailableToCommonStockholdersBasic"]
 
 
-def find_recent_filing_info():
-    """获取最近的财报提交信息"""
-    url = f"https://data.sec.gov/submissions/CIK{CIK}.json"
-    headers = {"User-Agent": "TeslaFetcher/1.0 (contact@example.com)"}
-    response = requests.get(url, headers=headers, timeout=30)
-    data = response.json()
+def get_xbrl_data(cik):
+    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+    headers = {"User-Agent": "Fetcher/1.0 (contact@example.com)"}
+    r = requests.get(url, headers=headers, timeout=30)
+    if r.status_code != 200:
+        print(f"  XBRL API失败 HTTP {r.status_code}")
+        return None
+    return r.json()
+
+
+def get_filing_info(cik):
+    url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+    headers = {"User-Agent": "Fetcher/1.0 (contact@example.com)"}
+    r = requests.get(url, headers=headers, timeout=30)
+    data = r.json()
     
     recent = data.get("filings", {}).get("recent", {})
-    filings = []
-    
+    result = []
     for idx, form in enumerate(recent.get("form", [])):
-        if form in ["10-K", "10-Q"]:
-            accession = recent["accessionNumber"][idx]
-            filing_date = recent["filingDate"][idx]
-            primary_doc = recent["primaryDocument"][idx]
-            filings.append({
-                "form": form, "date": filing_date,
-                "accession": accession, "document": primary_doc,
-                "url": f"https://www.sec.gov/Archives/edgar/data/{CIK}/{accession.replace('-', '')}/{primary_doc}"
+        if form in ["10-K", "10-Q", "20-F"]:
+            acc = recent["accessionNumber"][idx]
+            doc = recent["primaryDocument"][idx]
+            result.append({
+                "form": form, "date": recent["filingDate"][idx],
+                "url": f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc.replace('-', '')}/{doc}"
             })
     
     seen = set(); unique = []
-    for f in filings:
+    for f in result:
         key = (f["form"], f["date"])
         if key not in seen: seen.add(key); unique.append(f)
     return unique
 
 
-def get_metric_value(xbrl_data, concept_names, period_end=None, is_qtr=True):
-    """从XBRL数据提取指定指标的数值"""
+def get_metric_for_date(xbrl_data, concept_list, target_end_date, target_forms):
     facts = xbrl_data.get("facts", {})
-    
-    for us_gaap_or_other in ["us-gaap", "ifrs-full", "srt"]:
-        namespace = facts.get(us_gaap_or_other, {})
-        
-        for concept in concept_names:
-            if concept in namespace:
-                units = namespace[concept].get("units", {})
-                
-                # 优先用美元 (USD) 或纯数字
-                unit_keys = ["USD", "shares", "pure"]
-                for unit_key in unit_keys:
-                    if unit_key in units:
-                        entries = units[unit_key]
-                        
-                        # 找最近的年度/季度数据
-                        if period_end:
-                            for entry in entries:
-                                if entry.get("end") == period_end and entry.get("form") in ["10-K", "10-Q"]:
-                                    val = entry.get("val")
-                                    if val is not None:
-                                        return float(val)
-                        
-                        # 如果没有指定日期，返回最近的数据
-                        filtered = []
-                        for entry in entries:
-                            if entry.get("form") in ["10-K", "10-Q"]:
-                                filtered.append(entry)
-                        
-                        if filtered:
-                            filtered.sort(key=lambda e: e.get("end", ""), reverse=True)
-                            for entry in filtered[:20]:  # 检查最近20条
-                                val = entry.get("val")
-                                if val is not None and val != 0:
-                                    return float(val)
+    for ns in ["us-gaap", "ifrs-full", "srt"]:
+        namespace = facts.get(ns, {})
+        for concept in concept_list:
+            if concept not in namespace: continue
+            units = namespace[concept].get("units", {})
+            for unit_key, entries in units.items():
+                for entry in entries:
+                    if entry.get("end") == target_end_date and entry.get("form") in target_forms:
+                        val = entry.get("val")
+                        if val is not None and val != 0:
+                            return float(val)
     return None
 
 
-def get_metric_for_period(xbrl_data, concept_names, end_date):
-    """获取指定日期的指标值"""
+def get_all_metrics(xbrl_data, target_end_date, forms):
+    m = {}
+    m["revenue"] = get_metric_for_date(xbrl_data, REVENUE_CONCEPTS, target_end_date, forms)
+    m["net_income"] = get_metric_for_date(xbrl_data, NET_INCOME_CONCEPTS, target_end_date, forms)
+    m["gross_profit"] = get_metric_for_date(xbrl_data, GROSS_PROFIT_CONCEPTS, target_end_date, forms)
+    m["rd_expense"] = get_metric_for_date(xbrl_data, RD_CONCEPTS, target_end_date, forms)
+    m["cash"] = get_metric_for_date(xbrl_data, CASH_CONCEPTS, target_end_date, forms)
+    m["total_assets"] = get_metric_for_date(xbrl_data, ASSETS_CONCEPTS, target_end_date, forms)
+    m["equity"] = get_metric_for_date(xbrl_data, EQUITY_CONCEPTS, target_end_date, forms)
+    m["eps"] = get_metric_for_date(xbrl_data, EPS_CONCEPTS, target_end_date, forms)
+    if m.get("gross_profit") and m.get("revenue") and m["revenue"] > 0:
+        m["gross_margin"] = (m["gross_profit"] / m["revenue"]) * 100
+    return m
+
+
+def find_report_date(xbrl_data, form_types, top_n=3):
     facts = xbrl_data.get("facts", {})
-    
-    for namespace_name in ["us-gaap", "ifrs-full"]:
-        namespace = facts.get(namespace_name, {})
-        for concept in concept_names:
-            if concept in namespace:
-                units = namespace[concept].get("units", {})
-                unit_key = "USD" if namespace_name != "srt" else "pure"
-                if unit_key not in units:
-                    for k in units:
-                        unit_key = k; break
-                if unit_key in units:
-                    for entry in units[unit_key]:
-                        if entry.get("end") == end_date and entry.get("form") in ["10-K", "10-Q"]:
-                            val = entry.get("val")
-                            if val is not None and val != 0:
-                                return float(val)
-    return None
-
-
-def get_all_metrics_for_date(xbrl_data, end_date):
-    """获取指定日期的所有可用指标"""
-    metrics = {}
-    concepts_map = {
-        "revenue": ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", 
-                    "SalesRevenueNet", "Revenue", "TotalRevenuesAndOtherIncome",
-                    "RevenueFromContractWithCustomerIncludingAssessedTax",
-                    "ContractWithCustomerRevenue"],
-        "net_income": ["NetIncomeLoss", "NetIncomeLossAvailableToCommonStockholders", 
-                       "ProfitLoss", "NetIncome"],
-        "gross_profit": ["GrossProfit", "GrossMargin"],
-        "gross_margin_percent": [],  # 手动计算
-        "rd_expense": ["ResearchAndDevelopmentExpense", "ResearchDevelopmentAndRelatedExpense"],
-        "operating_income": ["OperatingIncomeLoss"],
-        "income_before_tax": ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndEquityMethodInvestments"],
-        "cash": ["CashAndCashEquivalentsAtCarryingValue", "CashAndCashEquivalentsPeriodIncreaseDecrease", 
-                 "Cash", "CashAndCashEquivalents"],
-        "total_assets": ["Assets"],
-        "total_liabilities": ["Liabilities"],
-        "equity": ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
-        "eps_basic": ["EarningsPerShareBasic", "EarningsPerShareBasicAndDiluted", 
-                      "IncomeLossAvailableToCommonStockholdersBasic"],
-        "eps_diluted": ["EarningsPerShareDiluted", "IncomeLossAvailableToCommonStockholdersDiluted"],
-        "automotive_revenue": ["RevenueFromContractWithCustomerExcludingAssessedTax"],  # 细分数据难找
-        "energy_revenue": [],  # 细分数据难找
-        "services_revenue": [],  # 细分数据难找
-    }
-    
-    for metric, concept_names in concepts_map.items():
-        if not concept_names: continue
-        val = get_metric_for_period(xbrl_data, concept_names, end_date)
-        if val is not None:
-            metrics[metric] = val
-    
-    # 计算毛利率
-    if "gross_profit" in metrics and "revenue" in metrics and metrics["revenue"] > 0:
-        metrics["gross_margin"] = (metrics["gross_profit"] / metrics["revenue"]) * 100
-    
-    return metrics
-
-
-def get_latest_10q_and_10k_dates(xbrl_data):
-    """找出最近的10-Q和10-K报告期结束日期"""
-    facts = xbrl_data.get("facts", {})
-    
-    # 从Revenue数据中找报告期
-    dates_10q = []
-    dates_10k = []
-    
-    for namespace_name in ["us-gaap", "ifrs-full"]:
-        namespace = facts.get(namespace_name, {})
+    dates = set()
+    for ns_name, namespace in facts.items():
         for concept_name, concept_data in namespace.items():
-            if any(keyword in concept_name.lower() for keyword in ["revenue", "netincome", "assets"]):
-                for unit, entries in concept_data.get("units", {}).items():
-                    for entry in entries:
-                        form = entry.get("form", "")
-                        end = entry.get("end", "")
-                        if form == "10-Q" and end:
-                            if end not in dates_10q: dates_10q.append(end)
-                        elif form == "10-K" and end:
-                            if end not in dates_10k: dates_10k.append(end)
+            for unit, entries in concept_data.get("units", {}).items():
+                for entry in entries:
+                    if entry.get("form") in form_types and entry.get("end"):
+                        dates.add(entry.get("end"))
+    return sorted(dates, reverse=True)[:top_n]
+
+
+def fmt_num(n, is_currency=True):
+    if n is None: return "N/A"
+    if abs(n) >= 1_000_000_000_000:
+        return f"${n/1_000_000_000_000:.2f}T" if is_currency else f"{n/1_000_000_000_000:.2f}T"
+    if abs(n) >= 1_000_000_000:
+        return f"${n/1_000_000_000:.2f}B" if is_currency else f"{n/1_000_000_000:.2f}B"
+    if abs(n) >= 1_000_000:
+        return f"${n/1_000_000:.2f}M" if is_currency else f"{n/1_000_000:.2f}M"
+    return f"${n:.2f}" if is_currency else f"{n:.2f}"
+
+
+def pct_change(curr, prev):
+    if curr is None or prev is None or prev == 0: return None
+    return ((curr - prev) / abs(prev)) * 100
+
+
+def analyze_company(name, cik, forms):
+    print(f"\n{'='*50}")
+    print(f"📊 {name}")
+    print(f"{'='*50}")
     
-    dates_10q.sort(reverse=True)
-    dates_10k.sort(reverse=True)
+    xbrl = get_xbrl_data(cik)
+    if xbrl is None: return None
     
-    return dates_10q[:3], dates_10k[:3]
-
-
-def format_number(num, is_currency=True):
-    if num is None: return "N/A"
-    if abs(num) >= 1_000_000_000:
-        val = num / 1_000_000_000
-        return f"${val:.2f}B" if is_currency else f"{val:.2f}B"
-    if abs(num) >= 1_000_000:
-        val = num / 1_000_000
-        return f"${val:.2f}M" if is_currency else f"{val:.2f}M"
-    return f"${num:.2f}" if is_currency else f"{num:.2f}"
-
-
-def calculate_change(current, previous):
-    if current is None or previous is None or previous == 0: return None
-    return ((current - previous) / abs(previous)) * 100
-
-
-def generate_report(current_filing, current_metrics, previous_filing, previous_metrics):
-    form_name = "年报" if current_filing["form"] == "10-K" else "季报"
-    report = []
-    report.append("=" * 55)
-    report.append("          Tesla 财务分析报告")
-    report.append("=" * 55)
-    report.append(f"报告期: {current_filing['date']} ({form_name})")
-    if previous_filing:
-        report.append(f"对比期: {previous_filing['date']} ({'年报' if previous_filing['form'] == '10-K' else '季报'})")
-    report.append(f"原文链接: {current_filing['url']}")
-    report.append("")
-    report.append("-" * 55)
-    report.append("【核心财务指标】")
-    report.append("-" * 55)
-    report.append("")
+    filings = get_filing_info(cik)
+    dates = find_report_date(xbrl, forms, top_n=5)
     
-    display_items = [
-        ("revenue", "营业收入", True),
-        ("gross_profit", "毛利润", True),
-        ("net_income", "净利润", True),
-        ("gross_margin", "毛利率(%)", False),
-        ("rd_expense", "研发费用", True),
-        ("operating_income", "运营收入", True),
-        ("cash", "现金及等价物", True),
-        ("total_assets", "总资产", True),
-        ("equity", "股东权益", True),
-        ("eps_basic", "每股收益($)", False),
-    ]
+    if not dates:
+        print(f"  ⚠️ 没有找到报告日期")
+        return None
     
-    for key, chinese_name, is_currency in display_items:
-        curr = current_metrics.get(key)
-        prev = previous_metrics.get(key) if previous_metrics else None
+    current_date = dates[0]
+    previous_date = dates[1] if len(dates) > 1 else None
+    
+    print(f"  当前期: {current_date}")
+    if previous_date: print(f"  对比期: {previous_date}")
+    
+    current = get_all_metrics(xbrl, current_date, forms)
+    
+    # 找最近的filing URL
+    current_url = None
+    for f in filings[:3]:
+        if f["form"] in forms:
+            current_url = f["url"]; break
+    
+    previous = {}
+    if previous_date:
+        previous = get_all_metrics(xbrl, previous_date, forms)
+    
+    print(f"  指标: {current}")
+    
+    return {
+        "name": name, "cik": cik, "form": "年报" if "10-K" in forms else "季报",
+        "current_date": current_date, "previous_date": previous_date,
+        "current": current, "previous": previous, "url": current_url
+    }
+
+
+def build_report(results):
+    lines = []
+    lines.append("=" * 65)
+    lines.append("            美股科技巨头财务报告")
+    lines.append(f"            生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    lines.append("=" * 65)
+    lines.append("")
+    
+    # 表格总览
+    lines.append("-" * 65)
+    lines.append("【核心指标总览】")
+    lines.append("-" * 65)
+    lines.append(f"{'公司':<18}{'营收':<14}{'净利润':<14}{'毛利率':<12}{'每股收益':<10}")
+    lines.append("-" * 65)
+    
+    for r in results:
+        if r is None: continue
+        name = r["name"].split(" ")[0]
+        rev = fmt_num(r["current"].get("revenue"), True)
+        ni = fmt_num(r["current"].get("net_income"), True)
+        gm = f"{r['current']['gross_margin']:.1f}%" if r["current"].get("gross_margin") else "N/A"
+        eps = f"${r['current']['eps']:.2f}" if r["current"].get("eps") else "N/A"
         
-        if curr is not None:
-            if key == "gross_margin":
-                curr_str = f"{curr:.1f}%"
-            elif key == "eps_basic":
-                curr_str = f"${curr:.2f}"
-            else:
-                curr_str = format_number(curr, is_currency)
+        rev_change = pct_change(r["current"].get("revenue"), r["previous"].get("revenue"))
+        rev_arrow = f"  ↑{abs(rev_change):.0f}%" if rev_change and rev_change > 0 else f"  ↓{abs(rev_change):.0f}%" if rev_change and rev_change < 0 else ""
+        
+        lines.append(f"{name:<18}{rev:<14}{ni:<14}{gm:<12}{eps:<10}{rev_arrow}")
+    
+    lines.append("")
+    
+    # 每家公司详细分析
+    for r in results:
+        if r is None: continue
+        
+        lines.append("-" * 65)
+        lines.append(f"【{r['name']}】 报告期: {r['current_date']} ({r['form']})")
+        if r["url"]: lines.append(f"原文: {r['url']}")
+        lines.append("-" * 65)
+        lines.append("")
+        
+        c = r["current"]; p = r["previous"]
+        
+        items = [
+            ("营业收入", "revenue", True),
+            ("毛利润", "gross_profit", True),
+            ("净利润", "net_income", True),
+            ("毛利率(%)", "gross_margin", False),
+            ("研发费用", "rd_expense", True),
+            ("现金及等价物", "cash", True),
+            ("总资产", "total_assets", True),
+            ("股东权益", "equity", True),
+            ("每股收益($)", "eps", False),
+        ]
+        
+        for label, key, is_currency in items:
+            curr = c.get(key)
+            prev = p.get(key) if p else None
+            
+            if curr is None: continue
+            
+            if key == "gross_margin": curr_str = f"{curr:.1f}%"
+            elif key == "eps": curr_str = f"${curr:.2f}"
+            else: curr_str = fmt_num(curr, is_currency)
             
             if prev is not None:
-                change = calculate_change(curr, prev)
+                change = pct_change(curr, prev)
                 if change is not None:
                     arrow = "↑" if change > 0 else "↓" if change < 0 else "→"
-                    report.append(f"  {chinese_name}: {curr_str}  {arrow}{abs(change):.1f}%")
+                    if key == "gross_margin":
+                        abs_change = curr - prev
+                        lines.append(f"  {label}: {curr_str}  {arrow}{abs(abs_change):.1f}pp")
+                    else:
+                        lines.append(f"  {label}: {curr_str}  {arrow}{abs(change):.1f}%")
                     continue
-            report.append(f"  {chinese_name}: {curr_str}")
-    
-    report.append("")
-    
-    # 变化分析
-    report.append("-" * 55)
-    report.append("【关键变化分析】")
-    report.append("-" * 55)
-    report.append("")
-    
-    changes = []
-    if previous_metrics:
-        if 'revenue' in current_metrics and 'revenue' in previous_metrics:
-            rev = calculate_change(current_metrics['revenue'], previous_metrics['revenue'])
-            if rev is not None and abs(rev) > 0.5:
-                direction = "增长" if rev > 0 else "下降"
-                changes.append(f"  • 营业收入{direction} {abs(rev):.1f}%，至 {format_number(current_metrics['revenue'])}")
+            lines.append(f"  {label}: {curr_str}")
         
-        if 'gross_profit' in current_metrics and 'gross_profit' in previous_metrics:
-            gp = calculate_change(current_metrics['gross_profit'], previous_metrics['gross_profit'])
-            if gp is not None and abs(gp) > 1:
-                direction = "增长" if gp > 0 else "下降"
-                changes.append(f"  • 毛利润{direction} {abs(gp):.1f}%，至 {format_number(current_metrics['gross_profit'])}")
+        # 关键变化
+        lines.append("")
+        highlights = []
+        if p and c.get("revenue") and p.get("revenue"):
+            rc = pct_change(c["revenue"], p["revenue"])
+            if rc is not None and abs(rc) > 0.5:
+                direction = "增长" if rc > 0 else "下降"
+                highlights.append(f"  • 营收{direction} {abs(rc):.1f}%，至 {fmt_num(c['revenue'])}")
         
-        if 'net_income' in current_metrics and 'net_income' in previous_metrics:
-            ni = calculate_change(current_metrics['net_income'], previous_metrics['net_income'])
-            if ni is not None and abs(ni) > 1:
-                direction = "增长" if ni > 0 else "下降"
-                changes.append(f"  • 净利润{direction} {abs(ni):.1f}%，至 {format_number(current_metrics['net_income'])}")
+        if p and c.get("net_income") and p.get("net_income"):
+            nc = pct_change(c["net_income"], p["net_income"])
+            if nc is not None and abs(nc) > 0.5:
+                direction = "增长" if nc > 0 else "下降"
+                highlights.append(f"  • 净利润{direction} {abs(nc):.1f}%，至 {fmt_num(c['net_income'])}")
         
-        if 'gross_margin' in current_metrics and 'gross_margin' in previous_metrics:
-            gm = current_metrics['gross_margin'] - previous_metrics['gross_margin']
+        if p and c.get("gross_margin") and p.get("gross_margin"):
+            gm = c["gross_margin"] - p["gross_margin"]
             if abs(gm) > 0.3:
                 direction = "上升" if gm > 0 else "下降"
-                changes.append(f"  • 毛利率{direction} {abs(gm):.1f}个百分点，至 {current_metrics['gross_margin']:.1f}%")
+                highlights.append(f"  • 毛利率{direction} {abs(gm):.1f}个百分点，至 {c['gross_margin']:.1f}%")
         
-        if 'cash' in current_metrics and 'cash' in previous_metrics:
-            cash = calculate_change(current_metrics['cash'], previous_metrics['cash'])
-            if cash is not None and abs(cash) > 5:
-                direction = "增加" if cash > 0 else "减少"
-                changes.append(f"  • 现金{direction} {abs(cash):.1f}%，当前 {format_number(current_metrics['cash'])}")
+        if highlights:
+            for h in highlights: lines.append(h)
+        else:
+            lines.append("  • 主要指标相对稳定")
+        
+        # 一句话总结
+        summary = []
+        if c.get("revenue"): summary.append(f"营收{fmt_num(c['revenue'])}")
+        if c.get("gross_margin"): summary.append(f"毛利率{c['gross_margin']:.0f}%")
+        if c.get("net_income"):
+            summary.append(f"{'净利润' if c['net_income'] > 0 else '净亏损'}{fmt_num(abs(c['net_income']))}")
+        if summary:
+            lines.append(f"\n  👉 {' | '.join(summary)}")
+        
+        lines.append("")
     
-    if changes:
-        for c in changes: report.append(c)
-    else:
-        report.append("  • 主要财务指标相对稳定")
+    lines.append("=" * 65)
+    lines.append("数据来源: SEC EDGAR (sec.gov)")
+    lines.append("报告类型: 10-K年报 / 10-Q季报 / 20-F外资年报")
+    lines.append("=" * 65)
     
-    report.append("")
-    
-    # 盈利能力指标
-    report.append("-" * 55)
-    report.append("【总结】")
-    report.append("-" * 55)
-    report.append("")
-    
-    summary = []
-    if 'revenue' in current_metrics:
-        summary.append(f"营收 {format_number(current_metrics['revenue'])}")
-    if 'gross_margin' in current_metrics:
-        summary.append(f"毛利率 {current_metrics['gross_margin']:.0f}%")
-    if 'net_income' in current_metrics:
-        ni = current_metrics['net_income']
-        summary.append(f"{'净利润' if ni > 0 else '净亏损'} {format_number(abs(ni))}")
-    
-    if summary:
-        report.append("  " + " | ".join(summary))
-    else:
-        report.append("  数据有限，请查看原文链接")
-    
-    report.append("")
-    report.append("=" * 55)
-    report.append(f"报告生成: {datetime.now().strftime('%Y-%m-%d')} | 数据来源: SEC EDGAR")
-    report.append("=" * 55)
-    return "\n".join(report)
+    return "\n".join(lines)
 
 
 def send_email(subject, content, recipient):
     if not SMTP_USER or not SMTP_PASSWORD:
-        return False, "未设置邮件账户 (SMTP_USER/SMTP_PASSWORD)"
+        return False, "未设置邮件账户"
     msg = MIMEText(content, "plain", "utf-8")
     msg["Subject"] = subject
     msg["From"] = SMTP_USER
     msg["To"] = recipient
     
-    configs = [(SMTP_SERVER, 25, "starttls"), (SMTP_SERVER, 587, "starttls"), (SMTP_SERVER, 465, "ssl")]
-    for server_host, port, method in configs:
+    for host, port, method in [(SMTP_SERVER, 25, "starttls"), (SMTP_SERVER, 587, "starttls"), (SMTP_SERVER, 465, "ssl")]:
         try:
-            if method == "ssl":
-                server = smtplib.SMTP_SSL(server_host, port, timeout=30)
-            else:
-                server = smtplib.SMTP(server_host, port, timeout=30)
-                server.starttls()
+            if method == "ssl": server = smtplib.SMTP_SSL(host, port, timeout=30)
+            else: server = smtplib.SMTP(host, port, timeout=30); server.starttls()
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.sendmail(SMTP_USER, recipient, msg.as_string())
             server.quit()
             return True, None
-        except Exception as e:
-            last_error = str(e)
-    return False, last_error
+        except Exception as e: last = str(e)
+    return False, last
 
 
-def analyze_filings():
-    print(f"[{datetime.now().isoformat()}] Tesla 财务分析...")
+def main():
+    print(f"[{datetime.now().isoformat()}] 开始抓取美股科技公司财报...")
+    print(f"公司数: {len(COMPANIES)}")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-    try:
-        # 获取XBRL结构化数据
-        print("从SEC API获取财务数据...")
-        xbrl_data = get_sec_xbrl_data()
-        
-        # 获取最近的财报信息
-        filings = find_recent_filing_info()
-        print(f"找到 {len(filings)} 个财报记录")
-        
-        if not filings:
-            print("没有找到财报"); return
-        
-        current_filing = filings[0]
-        previous_filing = None
-        
-        # 找同类型的上一期
-        for f in filings[1:]:
-            if f["form"] == current_filing["form"]:
-                previous_filing = f
-                break
-        
-        print(f"当前: {current_filing['form']} {current_filing['date']}")
-        if previous_filing: print(f"对比: {previous_filing['form']} {previous_filing['date']}")
-        
-        # 从XBRL数据提取报告日期和对应的指标
-        dates_10q, dates_10k = get_latest_10q_and_10k_dates(xbrl_data)
-        print(f"可用10-Q日期: {dates_10q[:3]}")
-        print(f"可用10-K日期: {dates_10k[:3]}")
-        
-        # 用当前filing的日期来查找对应的指标
-        # XBRL中的日期是报告期结束日期，需要映射
-        # 使用最近的可用日期
-        if current_filing["form"] == "10-Q":
-            current_dates = dates_10q
-        else:
-            current_dates = dates_10k
-        
-        if not current_dates:
-            print("警告: 没有找到报告日期")
-            return
-        
-        current_date = current_dates[0]
-        current_metrics = get_all_metrics_for_date(xbrl_data, current_date)
-        
-        previous_date = current_dates[1] if len(current_dates) > 1 else None
-        previous_metrics = {}
-        if previous_date:
-            previous_metrics = get_all_metrics_for_date(xbrl_data, previous_date)
-            if not previous_filing:
-                previous_filing = {"form": current_filing["form"], "date": previous_date}
-        
-        print(f"当前期({current_date}): {current_metrics}")
-        print(f"上期({previous_date}): {previous_metrics}")
-        
-        # 生成报告
-        report = generate_report(
-            {"form": current_filing["form"], "date": current_date, "url": current_filing["url"]},
-            current_metrics,
-            {"form": current_filing["form"], "date": previous_date} if previous_date else None,
-            previous_metrics
-        )
-        print("\n" + report + "\n")
-        
-        # 保存
-        report_file = os.path.join(OUTPUT_DIR, f"{current_filing['form']}_{current_date}_report.txt")
-        with open(report_file, "w", encoding="utf-8") as f:
-            f.write(report)
-        
-        # 发送邮件
-        form_name = "年报" if current_filing["form"] == "10-K" else "季报"
-        email_subject = f"【Tesla分析报告】{form_name} {current_date}"
-        print(f"发送邮件至 {RECIPIENT}...")
-        success, error = send_email(email_subject, report, RECIPIENT)
-        if success: print("✅ 报告已发送")
-        else: print(f"❌ 邮件发送失败: {error}")
-        
-    except Exception as e:
-        print(f"错误: {e}")
-        import traceback; traceback.print_exc()
+    results = []
+    for name, cik, forms in COMPANIES:
+        try:
+            result = analyze_company(name, cik, forms)
+            results.append(result)
+        except Exception as e:
+            print(f"  ❌ 错误: {e}")
+            results.append(None)
+        # SEC有请求频率限制
+        time.sleep(0.2)
+    
+    # 生成报告
+    report = build_report([r for r in results if r is not None])
+    print("\n" + report + "\n")
+    
+    # 保存
+    report_file = os.path.join(OUTPUT_DIR, f"multi_company_{datetime.now().strftime('%Y%m%d')}.txt")
+    with open(report_file, "w", encoding="utf-8") as f:
+        f.write(report)
+    
+    # 发送
+    subject = f"【美股财报报告】{datetime.now().strftime('%Y-%m-%d')} 科技巨头财务"
+    print(f"发送邮件至 {RECIPIENT}...")
+    success, error = send_email(subject, report, RECIPIENT)
+    if success: print("✅ 报告已发送")
+    else: print(f"❌ 邮件发送失败: {error}")
 
+
+import time as _time  # alias for backward compat
 
 if __name__ == "__main__":
-    analyze_filings()
+    main()
