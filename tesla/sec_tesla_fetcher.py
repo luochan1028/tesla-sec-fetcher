@@ -7,6 +7,7 @@ Multi-Company SEC Financial Reports Analyzer
 import requests
 import os
 import smtplib
+import time as _time
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta
 
@@ -17,7 +18,6 @@ SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 RECIPIENT = os.getenv("RECIPIENT", "luochan1028@126.com")
 
-# 公司配置: (中文名, CIK, 报告类型)
 COMPANIES = [
     ("Tesla 特斯拉", "0001318605", ["10-K", "10-Q"]),
     ("NVIDIA 英伟达", "0001045810", ["10-K", "10-Q"]),
@@ -54,33 +54,8 @@ def get_xbrl_data(cik):
     headers = {"User-Agent": "Fetcher/1.0 (contact@example.com)"}
     r = requests.get(url, headers=headers, timeout=30)
     if r.status_code != 200:
-        print(f"  XBRL API失败 HTTP {r.status_code}")
         return None
     return r.json()
-
-
-def get_filing_info(cik):
-    url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-    headers = {"User-Agent": "Fetcher/1.0 (contact@example.com)"}
-    r = requests.get(url, headers=headers, timeout=30)
-    data = r.json()
-    
-    recent = data.get("filings", {}).get("recent", {})
-    result = []
-    for idx, form in enumerate(recent.get("form", [])):
-        if form in ["10-K", "10-Q", "20-F"]:
-            acc = recent["accessionNumber"][idx]
-            doc = recent["primaryDocument"][idx]
-            result.append({
-                "form": form, "date": recent["filingDate"][idx],
-                "url": f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc.replace('-', '')}/{doc}"
-            })
-    
-    seen = set(); unique = []
-    for f in result:
-        key = (f["form"], f["date"])
-        if key not in seen: seen.add(key); unique.append(f)
-    return unique
 
 
 def get_metric_for_date(xbrl_data, concept_list, target_end_date, target_forms):
@@ -99,6 +74,34 @@ def get_metric_for_date(xbrl_data, concept_list, target_end_date, target_forms):
     return None
 
 
+def find_best_report_dates(xbrl_data, forms, top_n=5):
+    """通过查找有营收数据的报告期来确定最佳日期"""
+    facts = xbrl_data.get("facts", {})
+    
+    # 先尝试从revenue概念里找报告期
+    candidate_dates = []
+    for ns in ["us-gaap", "ifrs-full"]:
+        namespace = facts.get(ns, {})
+        if not namespace: continue
+        for concept_name, concept_data in namespace.items():
+            if "revenue" in concept_name.lower() or "income" in concept_name.lower() or "assets" in concept_name.lower():
+                for unit_key, entries in concept_data.get("units", {}).items():
+                    for entry in entries:
+                        if entry.get("form") in forms and entry.get("end") and entry.get("val"):
+                            candidate_dates.append((entry.get("end"), entry.get("form"), entry.get("val"))))
+    
+    # 按日期聚合，找有最高频率出现的日期
+    date_counts = {}
+    for d, form, val in candidate_dates:
+        if d not in date_counts:
+            date_counts[d] = 0
+        date_counts[d] += 1
+    
+    # 按出现频率排序，取top
+    sorted_dates = sorted(date_counts.keys(), key=lambda d: (-date_counts[d], d))
+    return sorted_dates[:top_n]
+
+
 def get_all_metrics(xbrl_data, target_end_date, forms):
     m = {}
     m["revenue"] = get_metric_for_date(xbrl_data, REVENUE_CONCEPTS, target_end_date, forms)
@@ -114,16 +117,23 @@ def get_all_metrics(xbrl_data, target_end_date, forms):
     return m
 
 
-def find_report_date(xbrl_data, form_types, top_n=3):
-    facts = xbrl_data.get("facts", {})
-    dates = set()
-    for ns_name, namespace in facts.items():
-        for concept_name, concept_data in namespace.items():
-            for unit, entries in concept_data.get("units", {}).items():
-                for entry in entries:
-                    if entry.get("form") in form_types and entry.get("end"):
-                        dates.add(entry.get("end"))
-    return sorted(dates, reverse=True)[:top_n]
+def get_filing_url(cik, filing_date, forms):
+    """获取最近财报的URL"""
+    url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+    headers = {"User-Agent": "Fetcher/1.0 (contact@example.com)"}
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code != 200: return None
+        data = r.json()
+        recent = data.get("filings", {}).get("recent", {})
+        for idx, form in enumerate(recent.get("form", [])):
+            if form in forms and recent["filingDate"][idx] >= filing_date[:7]:
+                acc = recent["accessionNumber"][idx]
+                doc = recent["primaryDocument"][idx]
+                return f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc.replace('-', '')}/{doc}"
+    except:
+        pass
+    return None
 
 
 def fmt_num(n, is_currency=True):
@@ -143,16 +153,16 @@ def pct_change(curr, prev):
 
 
 def analyze_company(name, cik, forms):
-    print(f"\n{'='*50}")
-    print(f"📊 {name}")
-    print(f"{'='*50}")
+    print(f"\n{'='*45}")
+    print(f"📊 {name} (CIK {cik})")
+    print(f"{'='*45}")
     
     xbrl = get_xbrl_data(cik)
-    if xbrl is None: return None
+    if xbrl is None:
+        print(f"  ❌ 无法获取数据")
+        return None
     
-    filings = get_filing_info(cik)
-    dates = find_report_date(xbrl, forms, top_n=5)
-    
+    dates = find_best_report_dates(xbrl, forms)
     if not dates:
         print(f"  ⚠️ 没有找到报告日期")
         return None
@@ -165,30 +175,40 @@ def analyze_company(name, cik, forms):
     
     current = get_all_metrics(xbrl, current_date, forms)
     
-    # 找最近的filing URL
-    current_url = None
-    for f in filings[:3]:
-        if f["form"] in forms:
-            current_url = f["url"]; break
+    # 获取当前期的filing URL
+    filing_url = get_filing_url(cik, current_date, forms)
     
     previous = {}
     if previous_date:
         previous = get_all_metrics(xbrl, previous_date, forms)
     
-    print(f"  指标: {current}")
+    # 过滤掉只有很少数据的条目
+    useful_count = sum(1 for v in current.values() if v is not None)
+    print(f"  获取指标数: {useful_count}/9")
+    
+    if useful_count < 3:
+        print(f"  ⚠️ 数据太少，尝试更多日期")
+        for d in dates[2:]:
+            m = get_all_metrics(xbrl, d, forms)
+            c = sum(1 for v in m.values() if v is not None)
+            if c >= useful_count and c >= 3:
+                current = m
+                current_date = d
+                print(f"  → 使用 {d} (有{c}个指标)")
+                break
     
     return {
-        "name": name, "cik": cik, "form": "年报" if "10-K" in forms else "季报",
+        "name": name, "form": "年报" if "10-K" in forms else "季报/年报",
         "current_date": current_date, "previous_date": previous_date,
-        "current": current, "previous": previous, "url": current_url
+        "current": current, "previous": previous, "url": filing_url
     }
 
 
 def build_report(results):
     lines = []
     lines.append("=" * 65)
-    lines.append("            美股科技巨头财务报告")
-    lines.append(f"            生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    lines.append("          美股科技巨头财务报告")
+    lines.append(f"          生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     lines.append("=" * 65)
     lines.append("")
     
@@ -196,30 +216,30 @@ def build_report(results):
     lines.append("-" * 65)
     lines.append("【核心指标总览】")
     lines.append("-" * 65)
-    lines.append(f"{'公司':<18}{'营收':<14}{'净利润':<14}{'毛利率':<12}{'每股收益':<10}")
+    lines.append(f"{'公司':<18}{'营收':<14}{'净利润':<14}{'毛利率':<10}{'EPS':<8}")
     lines.append("-" * 65)
     
     for r in results:
         if r is None: continue
-        name = r["name"].split(" ")[0]
+        short_name = r["name"].split(" ")[0][:16]
         rev = fmt_num(r["current"].get("revenue"), True)
         ni = fmt_num(r["current"].get("net_income"), True)
-        gm = f"{r['current']['gross_margin']:.1f}%" if r["current"].get("gross_margin") else "N/A"
+        gm = f"{r['current']['gross_margin']:.0f}%" if r["current"].get("gross_margin") else "N/A"
         eps = f"${r['current']['eps']:.2f}" if r["current"].get("eps") else "N/A"
         
         rev_change = pct_change(r["current"].get("revenue"), r["previous"].get("revenue"))
-        rev_arrow = f"  ↑{abs(rev_change):.0f}%" if rev_change and rev_change > 0 else f"  ↓{abs(rev_change):.0f}%" if rev_change and rev_change < 0 else ""
+        arrow = f"  ↑{abs(rev_change):.0f}%" if rev_change and rev_change > 0 else (f"  ↓{abs(rev_change):.0f}%" if rev_change and rev_change < 0 else "")
         
-        lines.append(f"{name:<18}{rev:<14}{ni:<14}{gm:<12}{eps:<10}{rev_arrow}")
+        lines.append(f"{short_name:<18}{rev:<14}{ni:<14}{gm:<10}{eps:<8}{arrow}")
     
     lines.append("")
     
     # 每家公司详细分析
-    for r in results:
+    for idx, r in enumerate(results):
         if r is None: continue
         
         lines.append("-" * 65)
-        lines.append(f"【{r['name']}】 报告期: {r['current_date']} ({r['form']})")
+        lines.append(f"【{r['name']}】报告期: {r['current_date']} ({r['form']})")
         if r["url"]: lines.append(f"原文: {r['url']}")
         lines.append("-" * 65)
         lines.append("")
@@ -253,8 +273,7 @@ def build_report(results):
                 if change is not None:
                     arrow = "↑" if change > 0 else "↓" if change < 0 else "→"
                     if key == "gross_margin":
-                        abs_change = curr - prev
-                        lines.append(f"  {label}: {curr_str}  {arrow}{abs(abs_change):.1f}pp")
+                        lines.append(f"  {label}: {curr_str}  {arrow}{abs(curr - prev):.1f}pp")
                     else:
                         lines.append(f"  {label}: {curr_str}  {arrow}{abs(change):.1f}%")
                     continue
@@ -286,22 +305,19 @@ def build_report(results):
         else:
             lines.append("  • 主要指标相对稳定")
         
-        # 一句话总结
         summary = []
         if c.get("revenue"): summary.append(f"营收{fmt_num(c['revenue'])}")
         if c.get("gross_margin"): summary.append(f"毛利率{c['gross_margin']:.0f}%")
         if c.get("net_income"):
             summary.append(f"{'净利润' if c['net_income'] > 0 else '净亏损'}{fmt_num(abs(c['net_income']))}")
+        
         if summary:
             lines.append(f"\n  👉 {' | '.join(summary)}")
-        
         lines.append("")
     
     lines.append("=" * 65)
-    lines.append("数据来源: SEC EDGAR (sec.gov)")
-    lines.append("报告类型: 10-K年报 / 10-Q季报 / 20-F外资年报")
+    lines.append("数据来源: SEC EDGAR (sec.gov) | 报告类型: 10-K/10-Q/20-F")
     lines.append("=" * 65)
-    
     return "\n".join(lines)
 
 
@@ -326,39 +342,31 @@ def send_email(subject, content, recipient):
 
 
 def main():
-    print(f"[{datetime.now().isoformat()}] 开始抓取美股科技公司财报...")
-    print(f"公司数: {len(COMPANIES)}")
+    print(f"[{datetime.now().isoformat()}] 开始抓取 {len(COMPANIES)} 家公司财报...")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
     results = []
     for name, cik, forms in COMPANIES:
         try:
-            result = analyze_company(name, cik, forms)
-            results.append(result)
+            results.append(analyze_company(name, cik, forms))
         except Exception as e:
             print(f"  ❌ 错误: {e}")
             results.append(None)
-        # SEC有请求频率限制
-        time.sleep(0.2)
+        _time.sleep(0.2)
     
-    # 生成报告
     report = build_report([r for r in results if r is not None])
     print("\n" + report + "\n")
     
-    # 保存
     report_file = os.path.join(OUTPUT_DIR, f"multi_company_{datetime.now().strftime('%Y%m%d')}.txt")
     with open(report_file, "w", encoding="utf-8") as f:
         f.write(report)
     
-    # 发送
     subject = f"【美股财报报告】{datetime.now().strftime('%Y-%m-%d')} 科技巨头财务"
     print(f"发送邮件至 {RECIPIENT}...")
     success, error = send_email(subject, report, RECIPIENT)
     if success: print("✅ 报告已发送")
     else: print(f"❌ 邮件发送失败: {error}")
 
-
-import time as _time  # alias for backward compat
 
 if __name__ == "__main__":
     main()
