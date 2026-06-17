@@ -88,7 +88,7 @@ def find_best_report_dates(xbrl_data, forms, top_n=5):
                 for unit_key, entries in concept_data.get("units", {}).items():
                     for entry in entries:
                         if entry.get("form") in forms and entry.get("end") and entry.get("val"):
-                            candidate_dates.append((entry.get("end"), entry.get("form"), entry.get("val"))))
+                            candidate_dates.append((entry["end"], entry["form"], entry["val"]))
     
     # 按日期聚合，找有最高频率出现的日期
     date_counts = {}
