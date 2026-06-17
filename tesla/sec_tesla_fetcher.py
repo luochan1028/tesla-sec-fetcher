@@ -127,25 +127,44 @@ def find_matching_comparison_date(xbrl_data, current_date, valid_dates, date_inf
     except:
         return None
     
+    # 只找同类型报告的日期
+    same_form_dates = [d for d in valid_dates if date_info[d]["form"] == current_form]
+    
+    # 10-K/20-F → 找去年同期
     if current_form in ["10-K", "20-F"]:
-        for d in valid_dates:
+        for d in same_form_dates:
             try:
                 dd = date.fromisoformat(d)
-                if (curr - dd).days in range(350, 390) and date_info[d]["form"] in ["10-K", "20-F"]:
+                delta_days = (curr - dd).days
+                if 350 <= delta_days <= 390:
                     return d
             except: continue
     
-    for target_days in [80, 100, 110, 350, 365, 380]:
-        for d in valid_dates:
+    # 10-Q → 找同季或上季
+    if current_form == "10-Q":
+        # 先找去年同季度（优先）
+        for d in same_form_dates:
             try:
                 dd = date.fromisoformat(d)
-                delta = abs((curr - dd).days - target_days)
-                if delta < 15 and d != current_date:
+                delta_days = (curr - dd).days
+                if 350 <= delta_days <= 390:
+                    return d
+            except: continue
+        
+        # 再找上季度
+        for d in same_form_dates:
+            try:
+                dd = date.fromisoformat(d)
+                delta_days = (curr - dd).days
+                if 80 <= delta_days <= 120:
                     return d
             except: continue
     
-    if len(valid_dates) > 1 and valid_dates[1] != current_date:
-        return valid_dates[1]
+    # 没有合适的，用最近的同类型日期
+    if len(same_form_dates) > 1:
+        for d in same_form_dates:
+            if d != current_date:
+                return d
     
     return None
 
@@ -167,12 +186,9 @@ def pct_change(curr, prev):
 
 
 def analyze_investment_signal(c, p):
-    """从股票投资角度分析利好/利空信号"""
     bullish = []
     bearish = []
-    neutral = []
     
-    # 营收增长 → 利好
     if c.get("revenue") and p.get("revenue"):
         rc = pct_change(c["revenue"], p["revenue"])
         if rc is not None:
@@ -184,10 +200,7 @@ def analyze_investment_signal(c, p):
                 bearish.append(f"营收大幅下滑 {abs(rc):.1f}%")
             elif rc < 0:
                 bearish.append(f"营收小幅下降 {abs(rc):.1f}%")
-            else:
-                neutral.append("营收持平")
     
-    # 净利润增长 → 利好
     if c.get("net_income") and p.get("net_income"):
         ni = pct_change(c["net_income"], p["net_income"])
         if ni is not None:
@@ -200,14 +213,12 @@ def analyze_investment_signal(c, p):
             elif ni < 0:
                 bearish.append(f"净利润下降 {abs(ni):.1f}%")
     
-    # 净利润由负转正 → 重大利好
     if p.get("net_income") and c.get("net_income"):
         if p["net_income"] < 0 and c["net_income"] >= 0:
             bullish.append("净利润扭亏为盈")
         elif p["net_income"] >= 0 and c["net_income"] < 0:
             bearish.append("净利润由盈转亏")
     
-    # 毛利率改善 → 利好
     if c.get("gross_margin") and p.get("gross_margin"):
         gm_change = c["gross_margin"] - p["gross_margin"]
         if gm_change > 2:
@@ -219,21 +230,18 @@ def analyze_investment_signal(c, p):
         elif gm_change < 0:
             bearish.append(f"毛利率下降 {abs(gm_change):.1f}pp")
     
-    # 毛利率绝对值高低
     if c.get("gross_margin"):
         if c["gross_margin"] > 60:
             bullish.append(f"高毛利率 {c['gross_margin']:.0f}%")
         elif c["gross_margin"] < 20:
             bearish.append(f"低毛利率 {c['gross_margin']:.0f}%")
     
-    # 现金流健康度
     if c.get("cash"):
         if c["cash"] > 10_000_000_000:
             bullish.append("现金充裕")
         elif c["cash"] < 1_000_000_000:
             bearish.append("现金紧张")
     
-    # EPS增长
     if c.get("eps") and p.get("eps"):
         eps_change = pct_change(c["eps"], p["eps"])
         if eps_change is not None and eps_change > 10:
@@ -241,7 +249,6 @@ def analyze_investment_signal(c, p):
         elif eps_change is not None and eps_change < -10:
             bearish.append(f"EPS下降 {abs(eps_change):.1f}%")
     
-    # 研发投入变化
     if c.get("rd_expense") and p.get("rd_expense"):
         rd_change = pct_change(c["rd_expense"], p["rd_expense"])
         if rd_change is not None:
@@ -250,11 +257,10 @@ def analyze_investment_signal(c, p):
             elif rd_change < -15:
                 bearish.append(f"研发投入大幅削减 {abs(rd_change):.1f}%")
     
-    return bullish, bearish, neutral
+    return bullish, bearish
 
 
-def get_investment_summary(bullish, bearish, neutral):
-    """综合判断投资信号"""
+def get_investment_summary(bullish, bearish):
     if len(bullish) >= 3 and len(bearish) <= 1:
         return "🟢 强烈利好", "多项关键指标向好，营收、利润、毛利率同步改善"
     elif len(bullish) >= 2 and len(bearish) == 0:
@@ -315,7 +321,6 @@ def build_report(results):
     lines.append("=" * 70)
     lines.append("")
     
-    # 投资信号总览
     lines.append("-" * 70)
     lines.append("【投资信号速览】")
     lines.append("-" * 70)
@@ -325,8 +330,8 @@ def build_report(results):
     for r in results:
         if r is None: continue
         short_name = r["name"].split(" ")[0][:16]
-        bullish, bearish, _ = analyze_investment_signal(r["current"], r["previous"])
-        signal, _ = get_investment_summary(bullish, bearish, [])
+        bullish, bearish = analyze_investment_signal(r["current"], r["previous"])
+        signal, _ = get_investment_summary(bullish, bearish)
         
         rev_change = pct_change(r["current"].get("revenue"), r["previous"].get("revenue"))
         rev_str = f"↑{rev_change:.0f}%" if rev_change and rev_change > 0 else (f"↓{abs(rev_change):.0f}%" if rev_change and rev_change < 0 else "N/A")
@@ -340,7 +345,6 @@ def build_report(results):
     
     lines.append("")
     
-    # 每家公司详细分析
     for r in results:
         if r is None: continue
         
@@ -353,7 +357,6 @@ def build_report(results):
         
         c = r["current"]; p = r["previous"]
         
-        # 核心指标
         lines.append("📈 【核心财务指标】")
         lines.append("-" * 40)
         
@@ -386,13 +389,12 @@ def build_report(results):
                     continue
             lines.append(f"  {label}: {curr_str}")
         
-        # 投资分析
         lines.append("")
         lines.append("💡 【股票投资分析】")
         lines.append("-" * 40)
         
-        bullish, bearish, neutral = analyze_investment_signal(c, p)
-        signal, signal_desc = get_investment_summary(bullish, bearish, neutral)
+        bullish, bearish = analyze_investment_signal(c, p)
+        signal, signal_desc = get_investment_summary(bullish, bearish)
         
         lines.append(f"  📊 综合信号: {signal}")
         lines.append(f"  💭 解读: {signal_desc}")
@@ -409,14 +411,6 @@ def build_report(results):
             for item in bearish[:5]:
                 lines.append(f"    • {item}")
         
-        if neutral:
-            lines.append("")
-            lines.append("  ⚪ 中性因素:")
-            for item in neutral[:3]:
-                lines.append(f"    • {item}")
-        
-        # 一句话总结
-        lines.append("")
         summary = []
         if c.get("revenue"): summary.append(f"营收{fmt_num(c['revenue'])}")
         if c.get("gross_margin"): summary.append(f"毛利率{c['gross_margin']:.0f}%")
@@ -424,22 +418,19 @@ def build_report(results):
             summary.append(f"{'净利润' if c['net_income'] > 0 else '净亏损'}{fmt_num(abs(c['net_income']))}")
         
         if summary:
-            lines.append(f"  👉 {' | '.join(summary)}")
+            lines.append(f"\n  👉 {' | '.join(summary)}")
         lines.append("")
     
-    # 整体市场分析
     lines.append("=" * 70)
     lines.append("📊 【整体市场分析】")
     lines.append("=" * 70)
     
-    bull_count = 0
-    bear_count = 0
-    neutral_count = 0
+    bull_count = 0; bear_count = 0; neutral_count = 0
     
     for r in results:
         if r is None: continue
-        bullish, bearish, _ = analyze_investment_signal(r["current"], r["previous"])
-        signal, _ = get_investment_summary(bullish, bearish, [])
+        bullish, bearish = analyze_investment_signal(r["current"], r["previous"])
+        signal, _ = get_investment_summary(bullish, bearish)
         
         if "强烈利好" in signal or "利好" in signal:
             bull_count += 1
@@ -461,7 +452,6 @@ def build_report(results):
     else:
         lines.append("  👉 市场分化明显，建议关注个股基本面")
     
-    # 风险提示
     lines.append(f"")
     lines.append("⚠️ 【风险提示】")
     lines.append("  • 本报告基于SEC公开财报数据，仅供参考")
