@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Multi-Company SEC Financial Reports Analyzer
-多公司财报分析：Tesla, NVIDIA, TSMC, Microsoft, Micron, Broadcom, Apple, AMD, Intel, Meta, Google, Amazon
+多公司财报分析 + 股票投资角度利好/利空判断
 """
 
 import requests
@@ -9,7 +9,7 @@ import os
 import smtplib
 import time as _time
 from email.mime.text import MIMEText
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 OUTPUT_DIR = "sec_filings"
 
@@ -35,8 +35,7 @@ COMPANIES = [
 
 REVENUE_CONCEPTS = [
     "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
-    "SalesRevenueNet", "Revenue", "TotalRevenuesAndOtherIncome",
-    "RevenueFromContractWithCustomerIncludingAssessedTax"
+    "SalesRevenueNet", "Revenue", "TotalRevenuesAndOtherIncome"
 ]
 NET_INCOME_CONCEPTS = [
     "NetIncomeLoss", "NetIncomeLossAvailableToCommonStockholders", "ProfitLoss", "NetIncome"
@@ -74,14 +73,10 @@ def get_metric_for_date(xbrl_data, concept_list, target_end_date, target_forms):
 
 
 def find_report_dates_with_metrics(xbrl_data):
-    """返回按日期分组的指标数据: {date: {form, revenue, net_income, gross_profit, ...}}"""
     facts = xbrl_data.get("facts", {})
     all_forms = ["10-K", "10-Q", "20-F"]
-    
-    # 按日期收集指标
     date_info = {}
     
-    # 只扫描核心指标来确定报告期
     core_concepts = {
         "revenue": REVENUE_CONCEPTS,
         "net_income": NET_INCOME_CONCEPTS,
@@ -105,12 +100,8 @@ def find_report_dates_with_metrics(xbrl_data):
                                 date_info[end] = {"form": form, "metrics": {}}
                             date_info[end]["metrics"][metric_name] = float(val)
     
-    # 只保留有营收的日期
     valid_dates = {d: info for d, info in date_info.items() if "revenue" in info["metrics"]}
-    
-    # 按日期排序
     sorted_dates = sorted(valid_dates.keys(), reverse=True)
-    
     return sorted_dates, valid_dates
 
 
@@ -130,20 +121,13 @@ def get_all_metrics(xbrl_data, target_end_date, forms):
 
 
 def find_matching_comparison_date(xbrl_data, current_date, valid_dates, date_info):
-    """找同类型的上一期报告日。10-K/20-F对上一年，10-Q对上一季或上年同季"""
     current_form = date_info[current_date]["form"]
-    
-    # 计算季度时长
-    from datetime import date
     try:
         curr = date.fromisoformat(current_date)
     except:
         return None
     
-    # 找最合适的对比日期
-    # 10-K/20-F → 找去年同期
     if current_form in ["10-K", "20-F"]:
-        # 找一年前的
         for d in valid_dates:
             try:
                 dd = date.fromisoformat(d)
@@ -151,7 +135,6 @@ def find_matching_comparison_date(xbrl_data, current_date, valid_dates, date_inf
                     return d
             except: continue
     
-    # 10-Q → 找上季度或上年同季
     for target_days in [80, 100, 110, 350, 365, 380]:
         for d in valid_dates:
             try:
@@ -161,7 +144,6 @@ def find_matching_comparison_date(xbrl_data, current_date, valid_dates, date_inf
                     return d
             except: continue
     
-    # 没有合适的，就用最近的第二个日期
     if len(valid_dates) > 1 and valid_dates[1] != current_date:
         return valid_dates[1]
     
@@ -182,6 +164,111 @@ def fmt_num(n, is_currency=True):
 def pct_change(curr, prev):
     if curr is None or prev is None or prev == 0: return None
     return ((curr - prev) / abs(prev)) * 100
+
+
+def analyze_investment_signal(c, p):
+    """从股票投资角度分析利好/利空信号"""
+    bullish = []
+    bearish = []
+    neutral = []
+    
+    # 营收增长 → 利好
+    if c.get("revenue") and p.get("revenue"):
+        rc = pct_change(c["revenue"], p["revenue"])
+        if rc is not None:
+            if rc > 10:
+                bullish.append(f"营收大幅增长 {rc:.1f}%")
+            elif rc > 0:
+                bullish.append(f"营收稳健增长 {rc:.1f}%")
+            elif rc < -10:
+                bearish.append(f"营收大幅下滑 {abs(rc):.1f}%")
+            elif rc < 0:
+                bearish.append(f"营收小幅下降 {abs(rc):.1f}%")
+            else:
+                neutral.append("营收持平")
+    
+    # 净利润增长 → 利好
+    if c.get("net_income") and p.get("net_income"):
+        ni = pct_change(c["net_income"], p["net_income"])
+        if ni is not None:
+            if ni > 20:
+                bullish.append(f"净利润大幅增长 {ni:.1f}%")
+            elif ni > 0:
+                bullish.append(f"净利润增长 {ni:.1f}%")
+            elif ni < -20:
+                bearish.append(f"净利润大幅下降 {abs(ni):.1f}%")
+            elif ni < 0:
+                bearish.append(f"净利润下降 {abs(ni):.1f}%")
+    
+    # 净利润由负转正 → 重大利好
+    if p.get("net_income") and c.get("net_income"):
+        if p["net_income"] < 0 and c["net_income"] >= 0:
+            bullish.append("净利润扭亏为盈")
+        elif p["net_income"] >= 0 and c["net_income"] < 0:
+            bearish.append("净利润由盈转亏")
+    
+    # 毛利率改善 → 利好
+    if c.get("gross_margin") and p.get("gross_margin"):
+        gm_change = c["gross_margin"] - p["gross_margin"]
+        if gm_change > 2:
+            bullish.append(f"毛利率显著提升 {gm_change:.1f}pp")
+        elif gm_change > 0:
+            bullish.append(f"毛利率改善 {gm_change:.1f}pp")
+        elif gm_change < -2:
+            bearish.append(f"毛利率大幅下降 {abs(gm_change):.1f}pp")
+        elif gm_change < 0:
+            bearish.append(f"毛利率下降 {abs(gm_change):.1f}pp")
+    
+    # 毛利率绝对值高低
+    if c.get("gross_margin"):
+        if c["gross_margin"] > 60:
+            bullish.append(f"高毛利率 {c['gross_margin']:.0f}%")
+        elif c["gross_margin"] < 20:
+            bearish.append(f"低毛利率 {c['gross_margin']:.0f}%")
+    
+    # 现金流健康度
+    if c.get("cash"):
+        if c["cash"] > 10_000_000_000:
+            bullish.append("现金充裕")
+        elif c["cash"] < 1_000_000_000:
+            bearish.append("现金紧张")
+    
+    # EPS增长
+    if c.get("eps") and p.get("eps"):
+        eps_change = pct_change(c["eps"], p["eps"])
+        if eps_change is not None and eps_change > 10:
+            bullish.append(f"EPS增长 {eps_change:.1f}%")
+        elif eps_change is not None and eps_change < -10:
+            bearish.append(f"EPS下降 {abs(eps_change):.1f}%")
+    
+    # 研发投入变化
+    if c.get("rd_expense") and p.get("rd_expense"):
+        rd_change = pct_change(c["rd_expense"], p["rd_expense"])
+        if rd_change is not None:
+            if rd_change > 15:
+                bullish.append(f"研发投入大幅增加 {rd_change:.1f}%")
+            elif rd_change < -15:
+                bearish.append(f"研发投入大幅削减 {abs(rd_change):.1f}%")
+    
+    return bullish, bearish, neutral
+
+
+def get_investment_summary(bullish, bearish, neutral):
+    """综合判断投资信号"""
+    if len(bullish) >= 3 and len(bearish) <= 1:
+        return "🟢 强烈利好", "多项关键指标向好，营收、利润、毛利率同步改善"
+    elif len(bullish) >= 2 and len(bearish) == 0:
+        return "🟢 利好", "核心指标表现优异，建议关注"
+    elif len(bullish) > len(bearish):
+        return "🟡 偏利好", "整体向好，但存在部分风险因素"
+    elif len(bearish) >= 3 and len(bullish) <= 1:
+        return "🔴 强烈利空", "多项关键指标恶化，营收、利润、毛利率同步下降"
+    elif len(bearish) >= 2 and len(bullish) == 0:
+        return "🔴 利空", "核心指标表现疲软，需谨慎"
+    elif len(bearish) > len(bullish):
+        return "🟡 偏利空", "整体承压，但部分指标仍有亮点"
+    else:
+        return "⚪ 中性", "指标分化，无明确趋势信号"
 
 
 def analyze_company(name, cik):
@@ -222,48 +309,53 @@ def analyze_company(name, cik):
 
 def build_report(results):
     lines = []
-    lines.append("=" * 65)
-    lines.append("           美股科技巨头财务报告")
-    lines.append(f"           生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    lines.append("=" * 65)
+    lines.append("=" * 70)
+    lines.append("        美股科技巨头财务报告 + 股票投资分析")
+    lines.append(f"        生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    lines.append("=" * 70)
     lines.append("")
     
-    # 总览表
-    lines.append("-" * 65)
-    lines.append("【核心指标总览】")
-    lines.append("-" * 65)
-    lines.append(f"{'公司':<18}{'营收':<14}{'净利润':<14}{'毛利率':<10}{'EPS':<8}")
-    lines.append("-" * 65)
+    # 投资信号总览
+    lines.append("-" * 70)
+    lines.append("【投资信号速览】")
+    lines.append("-" * 70)
+    lines.append(f"{'公司':<18}{'信号':<12}{'营收变化':<12}{'净利润变化':<12}{'毛利率':<10}")
+    lines.append("-" * 70)
     
     for r in results:
         if r is None: continue
         short_name = r["name"].split(" ")[0][:16]
-        rev = fmt_num(r["current"].get("revenue"))
-        ni = fmt_num(r["current"].get("net_income"))
-        gm = f"{r['current']['gross_margin']:.0f}%" if r["current"].get("gross_margin") else "N/A"
-        eps = f"${r['current']['eps']:.2f}" if r["current"].get("eps") else "N/A"
+        bullish, bearish, _ = analyze_investment_signal(r["current"], r["previous"])
+        signal, _ = get_investment_summary(bullish, bearish, [])
         
         rev_change = pct_change(r["current"].get("revenue"), r["previous"].get("revenue"))
-        arrow = ""
-        if rev_change is not None:
-            arrow = f"  ↑{abs(rev_change):.0f}%" if rev_change > 0 else (f"  ↓{abs(rev_change):.0f}%" if rev_change < 0 else "")
+        rev_str = f"↑{rev_change:.0f}%" if rev_change and rev_change > 0 else (f"↓{abs(rev_change):.0f}%" if rev_change and rev_change < 0 else "N/A")
         
-        lines.append(f"{short_name:<18}{rev:<14}{ni:<14}{gm:<10}{eps:<8}{arrow}")
+        ni_change = pct_change(r["current"].get("net_income"), r["previous"].get("net_income"))
+        ni_str = f"↑{ni_change:.0f}%" if ni_change and ni_change > 0 else (f"↓{abs(ni_change):.0f}%" if ni_change and ni_change < 0 else "N/A")
+        
+        gm = f"{r['current']['gross_margin']:.0f}%" if r["current"].get("gross_margin") else "N/A"
+        
+        lines.append(f"{short_name:<18}{signal:<12}{rev_str:<12}{ni_str:<12}{gm:<10}")
     
     lines.append("")
     
-    # 每家公司详细
+    # 每家公司详细分析
     for r in results:
         if r is None: continue
         
-        lines.append("-" * 65)
+        lines.append("-" * 70)
         lines.append(f"【{r['name']}】报告期: {r['current_date']} ({r['form']})")
         if r.get("previous_date"):
             lines.append(f"对比期: {r['previous_date']}")
-        lines.append("-" * 65)
+        lines.append("-" * 70)
         lines.append("")
         
         c = r["current"]; p = r["previous"]
+        
+        # 核心指标
+        lines.append("📈 【核心财务指标】")
+        lines.append("-" * 40)
         
         items = [
             ("营业收入", "revenue", True),
@@ -272,8 +364,6 @@ def build_report(results):
             ("毛利率(%)", "gross_margin", False),
             ("研发费用", "rd_expense", True),
             ("现金及等价物", "cash", True),
-            ("总资产", "total_assets", True),
-            ("股东权益", "equity", True),
             ("每股收益($)", "eps", False),
         ]
         
@@ -296,31 +386,37 @@ def build_report(results):
                     continue
             lines.append(f"  {label}: {curr_str}")
         
+        # 投资分析
         lines.append("")
-        highlights = []
-        if p and c.get("revenue") and p.get("revenue"):
-            rc = pct_change(c["revenue"], p["revenue"])
-            if rc is not None and abs(rc) > 0.5:
-                direction = "增长" if rc > 0 else "下降"
-                highlights.append(f"  • 营收{direction} {abs(rc):.1f}%，至 {fmt_num(c['revenue'])}")
+        lines.append("💡 【股票投资分析】")
+        lines.append("-" * 40)
         
-        if p and c.get("net_income") and p.get("net_income"):
-            nc = pct_change(c["net_income"], p["net_income"])
-            if nc is not None and abs(nc) > 0.5:
-                direction = "增长" if nc > 0 else "下降"
-                highlights.append(f"  • 净利润{direction} {abs(nc):.1f}%，至 {fmt_num(c['net_income'])}")
+        bullish, bearish, neutral = analyze_investment_signal(c, p)
+        signal, signal_desc = get_investment_summary(bullish, bearish, neutral)
         
-        if p and c.get("gross_margin") and p.get("gross_margin"):
-            gm = c["gross_margin"] - p["gross_margin"]
-            if abs(gm) > 0.3:
-                direction = "上升" if gm > 0 else "下降"
-                highlights.append(f"  • 毛利率{direction} {abs(gm):.1f}个百分点，至 {c['gross_margin']:.1f}%")
+        lines.append(f"  📊 综合信号: {signal}")
+        lines.append(f"  💭 解读: {signal_desc}")
+        lines.append("")
         
-        if highlights:
-            for h in highlights: lines.append(h)
-        else:
-            lines.append("  • 主要指标相对稳定")
+        if bullish:
+            lines.append("  🟢 利好因素:")
+            for item in bullish[:5]:
+                lines.append(f"    • {item}")
         
+        if bearish:
+            lines.append("")
+            lines.append("  🔴 利空因素:")
+            for item in bearish[:5]:
+                lines.append(f"    • {item}")
+        
+        if neutral:
+            lines.append("")
+            lines.append("  ⚪ 中性因素:")
+            for item in neutral[:3]:
+                lines.append(f"    • {item}")
+        
+        # 一句话总结
+        lines.append("")
         summary = []
         if c.get("revenue"): summary.append(f"营收{fmt_num(c['revenue'])}")
         if c.get("gross_margin"): summary.append(f"毛利率{c['gross_margin']:.0f}%")
@@ -328,13 +424,53 @@ def build_report(results):
             summary.append(f"{'净利润' if c['net_income'] > 0 else '净亏损'}{fmt_num(abs(c['net_income']))}")
         
         if summary:
-            lines.append(f"\n  👉 {' | '.join(summary)}")
+            lines.append(f"  👉 {' | '.join(summary)}")
         lines.append("")
     
-    lines.append("=" * 65)
+    # 整体市场分析
+    lines.append("=" * 70)
+    lines.append("📊 【整体市场分析】")
+    lines.append("=" * 70)
+    
+    bull_count = 0
+    bear_count = 0
+    neutral_count = 0
+    
+    for r in results:
+        if r is None: continue
+        bullish, bearish, _ = analyze_investment_signal(r["current"], r["previous"])
+        signal, _ = get_investment_summary(bullish, bearish, [])
+        
+        if "强烈利好" in signal or "利好" in signal:
+            bull_count += 1
+        elif "强烈利空" in signal or "利空" in signal:
+            bear_count += 1
+        else:
+            neutral_count += 1
+    
+    lines.append(f"")
+    lines.append(f"  📈 利好信号: {bull_count} 家")
+    lines.append(f"  📉 利空信号: {bear_count} 家")
+    lines.append(f"  ⚖️ 中性信号: {neutral_count} 家")
+    lines.append(f"")
+    
+    if bull_count > bear_count * 2:
+        lines.append("  👉 整体市场情绪偏乐观，多数科技股财报表现良好")
+    elif bear_count > bull_count * 2:
+        lines.append("  👉 整体市场情绪偏悲观，科技股面临压力")
+    else:
+        lines.append("  👉 市场分化明显，建议关注个股基本面")
+    
+    # 风险提示
+    lines.append(f"")
+    lines.append("⚠️ 【风险提示】")
+    lines.append("  • 本报告基于SEC公开财报数据，仅供参考")
+    lines.append("  • 投资有风险，入市需谨慎")
+    lines.append("  • 建议结合其他因素综合分析后再做决策")
+    lines.append(f"")
+    lines.append("=" * 70)
     lines.append("数据来源: SEC EDGAR | 报告类型: 10-K/10-Q/20-F")
-    lines.append("注: 部分对比期可能是不同的时间段，主要用于趋势参考")
-    lines.append("=" * 65)
+    lines.append("=" * 70)
     return "\n".join(lines)
 
 
@@ -378,7 +514,7 @@ def main():
     with open(report_file, "w", encoding="utf-8") as f:
         f.write(report)
     
-    subject = f"【美股财报报告】{datetime.now().strftime('%Y-%m-%d')} 科技巨头财务"
+    subject = f"【美股财报报告】{datetime.now().strftime('%Y-%m-%d')} 科技巨头财务+投资分析"
     print(f"发送邮件至 {RECIPIENT}...")
     success, error = send_email(subject, report, RECIPIENT)
     if success: print("✅ 报告已发送")
