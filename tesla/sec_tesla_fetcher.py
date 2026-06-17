@@ -11,7 +11,6 @@ import smtplib
 import html
 import time
 import random
-import urllib.parse
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta
 
@@ -25,8 +24,7 @@ RECIPIENT = os.getenv("RECIPIENT", "luochan1028@126.com")
 
 
 def get_recent_filings(forms=None, days_back=730):
-    if forms is None:
-        forms = ["10-K", "10-Q"]
+    if forms is None: forms = ["10-K", "10-Q"]
     url = f"https://data.sec.gov/submissions/CIK{CIK}.json"
     headers = {"User-Agent": "TeslaFetcher/1.0 (contact@example.com)"}
     response = requests.get(url, headers=headers, timeout=30)
@@ -37,18 +35,17 @@ def get_recent_filings(forms=None, days_back=730):
         if form_type in forms:
             filing_date = data["filings"]["recent"]["filingDate"][idx]
             if filing_date >= recent_date:
-                accession_number = data["filings"]["recent"]["accessionNumber"][idx]
-                primary_document = data["filings"]["recent"]["primaryDocument"][idx]
+                accession = data["filings"]["recent"]["accessionNumber"][idx]
+                document = data["filings"]["recent"]["primaryDocument"][idx]
                 filings.append({
                     "form": form_type, "date": filing_date,
-                    "accession": accession_number, "document": primary_document,
-                    "url": f"https://www.sec.gov/Archives/edgar/data/{CIK}/{accession_number.replace('-', '')}/{primary_document}"
+                    "accession": accession, "document": document,
+                    "url": f"https://www.sec.gov/Archives/edgar/data/{CIK}/{accession.replace('-', '')}/{document}"
                 })
     seen = set(); unique = []
     for f in filings:
         key = (f["form"], f["date"])
-        if key not in seen:
-            seen.add(key); unique.append(f)
+        if key not in seen: seen.add(key); unique.append(f)
     return unique
 
 
@@ -67,113 +64,142 @@ def extract_text_from_html(html_content):
     return text
 
 
-def parse_financial_number(text, pattern):
-    """从文本中提取数字和单位"""
-    match = re.search(pattern, text, re.IGNORECASE)
-    if not match:
-        return None
-    matched = match.group(0)
-    num_match = re.search(r'[\d,]+\.?\d*', matched)
-    if not num_match:
-        return None
-    try:
-        num = float(num_match.group().replace(',', ''))
-    except (ValueError, AttributeError):
-        return None
-    if num <= 0:
-        return num
-    lower = matched.lower()
-    if 'billion' in lower:
-        num *= 1_000_000_000
-    elif 'million' in lower:
-        num *= 1_000_000
-    elif 'thousand' in lower:
-        num *= 1_000
-    return num
+def find_number_near_keyword(text, keyword_pattern, context_chars=100):
+    """在关键词附近找数字"""
+    text_lower = text.lower()
+    match_iter = re.finditer(keyword_pattern, text_lower, re.IGNORECASE)
+    
+    results = []
+    for match in match_iter:
+        start = max(0, match.start() - context_chars)
+        end = min(len(text), match.end() + context_chars)
+        context = text[start:end]
+        
+        # 在此上下文中找数字（带$或不带）
+        # 格式如: $12,345 或 12,345 或 12.34
+        num_patterns = [
+            r'\$\s*[\d,]+\.?\d*',
+            r'[\d,]+\.\d+',
+            r'[\d,]+',
+        ]
+        for pat in num_patterns:
+            num_matches = re.findall(pat, context)
+            for nm in num_matches:
+                try:
+                    num_str = nm.replace('$', '').replace(',', '').strip()
+                    num = float(num_str)
+                    if num != 0:
+                        results.append((num, context))
+                        if len(results) >= 3: return results
+                except (ValueError, AttributeError):
+                    continue
+    return results
 
 
 def extract_financial_metrics(text):
     """提取关键财务指标"""
     metrics = {}
+    
+    # SEC财报数字可能很大（直接是美元数）或带单位
+    # 先检测报告单位
     text_lower = text.lower()
     
+    # 检测报告是否以million/thousand为单位
+    # 通常SEC 10-Q的数字是直接以美元显示的大数
+    
+    def find_big_number(pattern, min_val=1_000_000):
+        """找一个大数字，返回最合适的值"""
+        results = find_number_near_keyword(text, pattern, 150)
+        
+        # 过滤得到合理的数值
+        candidates = []
+        for num, ctx in results:
+            if abs(num) >= min_val:
+                candidates.append(num)
+        
+        # 取出现频率高或第一个合理值
+        if candidates:
+            # 取绝对值最大的（通常是总数）
+            return max(candidates, key=abs)
+        
+        # 如果数字很小（可能是million单位）
+        small_candidates = []
+        for num, ctx in results:
+            if 0 < abs(num) < 100_000:
+                # 判断是否含million/thousand
+                if 'million' in ctx.lower() or 'millions' in ctx.lower():
+                    candidates.append(num * 1_000_000)
+                elif 'thousand' in ctx.lower() or 'thousands' in ctx.lower():
+                    candidates.append(num * 1_000)
+                elif 'billion' in ctx.lower() or 'billions' in ctx.lower():
+                    candidates.append(num * 1_000_000_000)
+        
+        if candidates:
+            return max(candidates, key=abs)
+        
+        # 直接找数字，乘以百万假设
+        for num, ctx in results:
+            if abs(num) > 100:
+                return num
+        return None
+    
     # 营收
-    for pattern in [
-        r'(?:total\s+)?(?:revenue|net\s+sales?)\s*[:\-]?\s*\$?\s*[\d,]+\.?\d*\s*(?:million|billion|thousand)?',
-    ]:
-        val = parse_financial_number(text, pattern)
-        if val and abs(val) > 1_000_000:
-            metrics['revenue'] = val
-            break
+    val = find_big_number(r'(?:total\s+)?(?:revenue|net\s+sales?|revenues?|total\s+net\s+revenue)')
+    if val: metrics['revenue'] = val
     
-    # 净利润
-    for pattern in [
-        r'net\s+(?:income|loss)\s*[:\-]?\s*\$?\s*[\d,]+\.?\d*\s*(?:million|billion|thousand)?',
-    ]:
-        val = parse_financial_number(text, pattern)
-        if val is not None and abs(val) > 100_000:
-            metrics['net_income'] = val
-            break
+    # 净利润（可能是负的）
+    val = find_big_number(r'net\s+(?:income|loss|income\s*\(loss\))|income\s+before|net\s+income\s+attributable')
+    if val: metrics['net_income'] = val
     
-    # 毛利率
-    match = re.search(r'gross\s+margin\s*[:\-]?\s*[\d,]+\.?\d*\s*%', text, re.IGNORECASE)
-    if match:
-        val_match = re.search(r'[\d,]+\.?\d*', match.group())
-        if val_match:
-            try:
-                metrics['gross_margin'] = float(val_match.group().replace(',', ''))
-            except ValueError:
-                pass
+    # 毛利润
+    val = find_big_number(r'gross\s+(?:profit|margin)|(?:cost\s+of\s+)?revenue.*gross|gross.*profit')
+    if val: 
+        if abs(val) < 100:  # 可能是百分比
+            metrics['gross_margin'] = abs(val)
+        else:
+            metrics['gross_profit'] = val
+    
+    # 毛利率百分比
+    margin_results = find_number_near_keyword(text, r'gross\s+margin|gross\s+profit\s+margin|gross\s+profit\s+as', 100)
+    for num, ctx in margin_results:
+        if 5 < abs(num) < 60:
+            metrics['gross_margin'] = abs(num)
+            break
     
     # 研发费用
-    match = re.search(r'research\s+and\s+development\s*[:\-]?\s*\$?\s*[\d,]+\.?\d*\s*(?:million|billion|thousand)?', text, re.IGNORECASE)
-    if match:
-        val = parse_financial_number(text, r'research\s+and\s+development\s*[:\-]?\s*\$?\s*[\d,]+\.?\d*\s*(?:million|billion|thousand)?')
-        if val and abs(val) > 100_000:
-            metrics['rd_expense'] = val
+    val = find_big_number(r'research\s+and\s+development|research\s*&\s*development\s*(?:expenses?)?')
+    if val: metrics['rd_expense'] = val
     
     # 现金
-    for pattern in [
-        r'cash\s+(?:and\s+)?(?:cash\s+)?equivalents?\s*[:\-]?\s*\$?\s*[\d,]+\.?\d*\s*(?:million|billion|thousand)?',
-    ]:
-        val = parse_financial_number(text, pattern)
-        if val and abs(val) > 100_000_000:
-            metrics['cash'] = val
-            break
+    val = find_big_number(r'cash\s+(?:and\s+)?(?:cash\s+)?equivalents?|cash\s+and\s+cash\s+equivalents')
+    if val: metrics['cash'] = val
     
     # 总资产
-    for pattern in [
-        r'total\s+assets\s*[:\-]?\s*\$?\s*[\d,]+\.?\d*\s*(?:million|billion|thousand)?',
-    ]:
-        val = parse_financial_number(text, pattern)
-        if val and abs(val) > 1_000_000_000:
-            metrics['total_assets'] = val
-            break
+    val = find_big_number(r'total\s+assets')
+    if val: metrics['total_assets'] = val
+    
+    # 股东权益
+    val = find_big_number(r'(?:stockholders?|shareholders?)\s+(?:equity|deficit)|total\s+(?:stockholders?|shareholders?)\s+(?:equity|deficit)')
+    if val: metrics['equity'] = val
+    
+    # 汽车业务
+    val = find_big_number(r'automotive\s+(?:sales?|revenue)|total\s+automotive\s+(?:revenue|sales?)')
+    if val: metrics['automotive_revenue'] = val
+    
+    # 能源业务
+    val = find_big_number(r'energy\s+(?:generation|storage|segment|revenue|sales?)|energy\s+generation\s+and\s+storage')
+    if val: metrics['energy_revenue'] = val
+    
+    # 服务业务
+    val = find_big_number(r'services?\s+(?:and\s+others?\s+)?revenue|services?\s+revenue')
+    if val: metrics['services_revenue'] = val
     
     # 每股收益
-    match = re.search(r'(?:earnings|net\s+income)\s+per\s+share\s*[:\-]?\s*\$?\s*[\d,]+\.?\d*', text, re.IGNORECASE)
-    if match:
-        val_match = re.search(r'[\d,]+\.?\d*', match.group())
-        if val_match:
-            try:
-                metrics['eps'] = float(val_match.group().replace(',', ''))
-            except ValueError:
-                pass
-    
-    # 汽车业务营收
-    val = parse_financial_number(text, r'automotive\s+(?:sales|revenue)\s*[:\-]?\s*\$?\s*[\d,]+\.?\d*\s*(?:million|billion|thousand)?')
-    if val and abs(val) > 1_000_000:
-        metrics['automotive_revenue'] = val
-    
-    # 能源业务营收
-    val = parse_financial_number(text, r'energy\s+(?:generation|storage|segment)\s*(?:revenue)?\s*[:\-]?\s*\$?\s*[\d,]+\.?\d*\s*(?:million|billion|thousand)?')
-    if val and abs(val) > 100_000:
-        metrics['energy_revenue'] = val
-    
-    # 服务业务营收
-    val = parse_financial_number(text, r'services?\s+revenue\s*[:\-]?\s*\$?\s*[\d,]+\.?\d*\s*(?:million|billion|thousand)?')
-    if val and abs(val) > 100_000:
-        metrics['services_revenue'] = val
+    eps_results = find_number_near_keyword(text, r'(?:earnings?|net\s+income)\s+per\s+share|basic\s+earnings?\s+per\s+share|eps', 100)
+    for num, ctx in eps_results:
+        if 0 < abs(num) < 20:
+            metrics['eps'] = num
+            break
     
     return metrics
 
@@ -187,8 +213,7 @@ def format_number(num):
 
 
 def calculate_change(current, previous):
-    if current is None or previous is None or previous == 0:
-        return None
+    if current is None or previous is None or previous == 0: return None
     return ((current - previous) / abs(previous)) * 100
 
 
@@ -210,14 +235,16 @@ def generate_report(current_filing, current_metrics, previous_filing, previous_m
     
     metrics_display = [
         ("revenue", "营业收入", True),
+        ("gross_profit", "毛利润", True),
         ("net_income", "净利润", True),
         ("gross_margin", "毛利率(%)", False),
         ("rd_expense", "研发费用", True),
         ("cash", "现金及等价物", True),
         ("total_assets", "总资产", True),
-        ("automotive_revenue", "汽车业务", True),
-        ("energy_revenue", "能源业务", True),
-        ("services_revenue", "服务业务", True),
+        ("equity", "股东权益", True),
+        ("automotive_revenue", "汽车业务营收", True),
+        ("energy_revenue", "能源业务营收", True),
+        ("services_revenue", "服务业务营收", True),
         ("eps", "每股收益($)", True),
     ]
     
@@ -248,24 +275,30 @@ def generate_report(current_filing, current_metrics, previous_filing, previous_m
     report.append("")
     
     changes = []
-    if 'revenue' in current_metrics and 'revenue' in previous_metrics if previous_metrics else False:
-        if previous_metrics:
+    if previous_metrics:
+        if 'revenue' in current_metrics and 'revenue' in previous_metrics:
             rev_change = calculate_change(current_metrics['revenue'], previous_metrics['revenue'])
-            if rev_change is not None and abs(rev_change) > 3:
+            if rev_change is not None and abs(rev_change) > 1:
                 direction = "增长" if rev_change > 0 else "下降"
                 changes.append(f"  • 营业收入{direction} {abs(rev_change):.1f}%，{direction}至 {format_number(current_metrics['revenue'])}")
-    
-    if previous_metrics and 'net_income' in current_metrics and 'net_income' in previous_metrics:
-        ni_change = calculate_change(current_metrics['net_income'], previous_metrics['net_income'])
-        if ni_change is not None and abs(ni_change) > 5:
-            direction = "增长" if ni_change > 0 else "下降"
-            changes.append(f"  • 净利润{direction} {abs(ni_change):.1f}%，{direction}至 {format_number(current_metrics['net_income'])}")
-    
-    if previous_metrics and 'automotive_revenue' in current_metrics and 'automotive_revenue' in previous_metrics:
-        auto_change = calculate_change(current_metrics['automotive_revenue'], previous_metrics['automotive_revenue'])
-        if auto_change is not None and abs(auto_change) > 3:
-            direction = "增长" if auto_change > 0 else "下降"
-            changes.append(f"  • 汽车业务{direction} {abs(auto_change):.1f}%，{direction}至 {format_number(current_metrics['automotive_revenue'])}")
+        
+        if 'net_income' in current_metrics and 'net_income' in previous_metrics:
+            ni_change = calculate_change(current_metrics['net_income'], previous_metrics['net_income'])
+            if ni_change is not None and abs(ni_change) > 1:
+                direction = "增长" if ni_change > 0 else "下降"
+                changes.append(f"  • 净利润{direction} {abs(ni_change):.1f}%，{direction}至 {format_number(current_metrics['net_income'])}")
+        
+        if 'automotive_revenue' in current_metrics and 'automotive_revenue' in previous_metrics:
+            auto_change = calculate_change(current_metrics['automotive_revenue'], previous_metrics['automotive_revenue'])
+            if auto_change is not None and abs(auto_change) > 1:
+                direction = "增长" if auto_change > 0 else "下降"
+                changes.append(f"  • 汽车业务{direction} {abs(auto_change):.1f}%，{direction}至 {format_number(current_metrics['automotive_revenue'])}")
+        
+        if 'gross_margin' in current_metrics and 'gross_margin' in previous_metrics:
+            gm_change = current_metrics['gross_margin'] - previous_metrics['gross_margin']
+            if abs(gm_change) > 0.5:
+                direction = "上升" if gm_change > 0 else "下降"
+                changes.append(f"  • 毛利率{direction} {abs(gm_change):.1f}个百分点，至 {current_metrics['gross_margin']:.1f}%")
     
     if changes:
         for c in changes: report.append(c)
@@ -312,6 +345,8 @@ def generate_report(current_filing, current_metrics, previous_filing, previous_m
     
     if summary:
         report.append("  " + " | ".join(summary))
+    else:
+        report.append("  数据提取有限，请查看原文链接")
     
     report.append("")
     report.append("=" * 55)
@@ -322,7 +357,7 @@ def generate_report(current_filing, current_metrics, previous_filing, previous_m
 
 def send_email(subject, content, recipient):
     if not SMTP_USER or not SMTP_PASSWORD:
-        return False, "未设置邮件账户"
+        return False, "未设置邮件账户 (SMTP_USER/SMTP_PASSWORD)"
     msg = MIMEText(content, "plain", "utf-8")
     msg["Subject"] = subject
     msg["From"] = SMTP_USER
@@ -360,8 +395,7 @@ def analyze_filings():
                     previous_filing = f
                     break
         
-        if not current_filing:
-            print("未找到财报"); return
+        if not current_filing: print("未找到财报"); return
         print(f"当前: {current_filing['form']} {current_filing['date']}")
         if previous_filing: print(f"上期: {previous_filing['form']} {previous_filing['date']}")
         
@@ -381,7 +415,7 @@ def analyze_filings():
         
         print("生成分析报告...")
         report = generate_report(current_filing, current_metrics, previous_filing, previous_metrics)
-        print(report)
+        print("\n" + report + "\n")
         
         filename_key = f"{current_filing['form']}_{current_filing['date']}_report.txt"
         report_file = os.path.join(OUTPUT_DIR, filename_key)
@@ -390,7 +424,7 @@ def analyze_filings():
         
         form_name = "年报" if current_filing["form"] == "10-K" else "季报"
         email_subject = f"【Tesla分析报告】{form_name} {current_filing['date']}"
-        print(f"\n发送邮件至 {RECIPIENT}...")
+        print(f"发送邮件至 {RECIPIENT}...")
         success, error = send_email(email_subject, report, RECIPIENT)
         if success: print("✅ 报告已发送")
         else: print(f"❌ 邮件发送失败: {error}")
