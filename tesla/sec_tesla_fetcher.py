@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 """
 Multi-Company SEC Financial Reports Analyzer
-多公司财报分析 + 股票投资角度利好/利空判断
+多公司财报分析 + 股票投资角度利好/利空判断 + 新财报检测
 """
 
 import requests
 import os
 import smtplib
 import time as _time
+import json
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta, date
 
 OUTPUT_DIR = "sec_filings"
+STATE_FILE = os.path.join(OUTPUT_DIR, "last_state.json")
 
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.126.com")
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 RECIPIENT = os.getenv("RECIPIENT", "luochan1028@126.com")
+
+# 环境变量：强制发送邮件（即使没有新财报）
+FORCE_SEND = os.getenv("FORCE_SEND", "false").lower() == "true"
 
 COMPANIES = [
     ("Tesla 特斯拉", "0001318605"),
@@ -54,6 +59,34 @@ def get_xbrl_data(cik):
     r = requests.get(url, headers=headers, timeout=30)
     if r.status_code != 200: return None
     return r.json()
+
+
+def get_latest_filing_date(cik):
+    """获取公司最近一次财报提交日期"""
+    url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+    headers = {"User-Agent": "Fetcher/1.0 (contact@example.com)"}
+    r = requests.get(url, headers=headers, timeout=30)
+    if r.status_code != 200: return None, None
+    
+    data = r.json()
+    recent = data.get("filings", {}).get("recent", {})
+    
+    latest_10k = None
+    latest_10q = None
+    
+    for idx, form in enumerate(recent.get("form", [])):
+        if form == "10-K" and latest_10k is None:
+            latest_10k = recent["filingDate"][idx]
+        elif form == "10-Q" and latest_10q is None:
+            latest_10q = recent["filingDate"][idx]
+        elif form == "20-F" and latest_10k is None:
+            latest_10k = recent["filingDate"][idx]
+        
+        if latest_10k and latest_10q:
+            break
+    
+    latest = max(filter(None, [latest_10k, latest_10q])) if (latest_10k or latest_10q) else None
+    return latest, {"10-K": latest_10k, "10-Q": latest_10q}
 
 
 def get_metric_for_date(xbrl_data, concept_list, target_end_date, target_forms):
@@ -127,10 +160,8 @@ def find_matching_comparison_date(xbrl_data, current_date, valid_dates, date_inf
     except:
         return None
     
-    # 只找同类型报告的日期
     same_form_dates = [d for d in valid_dates if date_info[d]["form"] == current_form]
     
-    # 10-K/20-F → 找去年同期
     if current_form in ["10-K", "20-F"]:
         for d in same_form_dates:
             try:
@@ -140,9 +171,7 @@ def find_matching_comparison_date(xbrl_data, current_date, valid_dates, date_inf
                     return d
             except: continue
     
-    # 10-Q → 找同季或上季
     if current_form == "10-Q":
-        # 先找去年同季度（优先）
         for d in same_form_dates:
             try:
                 dd = date.fromisoformat(d)
@@ -151,7 +180,6 @@ def find_matching_comparison_date(xbrl_data, current_date, valid_dates, date_inf
                     return d
             except: continue
         
-        # 再找上季度
         for d in same_form_dates:
             try:
                 dd = date.fromisoformat(d)
@@ -160,7 +188,6 @@ def find_matching_comparison_date(xbrl_data, current_date, valid_dates, date_inf
                     return d
             except: continue
     
-    # 没有合适的，用最近的同类型日期
     if len(same_form_dates) > 1:
         for d in same_form_dates:
             if d != current_date:
@@ -309,18 +336,95 @@ def analyze_company(name, cik):
     return {
         "name": name, "form": "年报" if current_form in ["10-K", "20-F"] else "季报",
         "current_date": current_date, "previous_date": previous_date,
-        "current": current, "previous": previous
+        "current": current, "previous": previous,
+        "report_form": current_form
     }
 
 
-def build_report(results):
+def load_state():
+    """加载上次运行状态"""
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+
+def save_state(state):
+    """保存运行状态"""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def check_new_filings():
+    """检查是否有新的财报提交"""
+    last_state = load_state()
+    current_state = {}
+    new_filings = []
+    
+    print("\n" + "="*50)
+    print("🔍 检查新财报...")
+    print("="*50)
+    
+    for name, cik in COMPANIES:
+        latest_date, details = get_latest_filing_date(cik)
+        current_state[cik] = {
+            "name": name,
+            "latest_date": latest_date,
+            "details": details
+        }
+        
+        last_date = last_state.get(cik, {}).get("latest_date")
+        if latest_date and (last_date is None or latest_date > last_date):
+            print(f"  🆕 {name}: 新财报 {latest_date} (上次: {last_date})")
+            new_filings.append({
+                "name": name, "cik": cik,
+                "new_date": latest_date,
+                "old_date": last_date
+            })
+        else:
+            print(f"  ✓ {name}: 无更新 ({latest_date})")
+        
+        _time.sleep(0.2)
+    
+    # 保存当前状态
+    save_state(current_state)
+    
+    return new_filings, current_state
+
+
+def build_report(results, new_filings=None):
+    if new_filings is None:
+        new_filings = []
+    
+    new_company_names = {nf["name"] for nf in new_filings}
+    
     lines = []
     lines.append("=" * 70)
-    lines.append("        美股科技巨头财务报告 + 股票投资分析")
+    
+    if new_filings:
+        lines.append("  🎉 发现新财报！美股科技巨头财务报告")
+        lines.append(f"  🆕 新财报公司: {', '.join(nf['name'] for nf in new_filings)}")
+    else:
+        lines.append("        美股科技巨头财务报告 + 股票投资分析")
+    
     lines.append(f"        生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     lines.append("=" * 70)
     lines.append("")
     
+    # 新财报摘要
+    if new_filings:
+        lines.append("-" * 70)
+        lines.append("🆕 【新财报发布】")
+        lines.append("-" * 70)
+        for nf in new_filings:
+            lines.append(f"  • {nf['name']}: {nf['new_date']}")
+        lines.append("")
+    
+    # 投资信号速览
     lines.append("-" * 70)
     lines.append("【投资信号速览】")
     lines.append("-" * 70)
@@ -330,6 +434,9 @@ def build_report(results):
     for r in results:
         if r is None: continue
         short_name = r["name"].split(" ")[0][:16]
+        is_new = r["name"] in new_company_names
+        prefix = "🆕 " if is_new else ""
+        
         bullish, bearish = analyze_investment_signal(r["current"], r["previous"])
         signal, _ = get_investment_summary(bullish, bearish)
         
@@ -341,86 +448,34 @@ def build_report(results):
         
         gm = f"{r['current']['gross_margin']:.0f}%" if r["current"].get("gross_margin") else "N/A"
         
-        lines.append(f"{short_name:<18}{signal:<12}{rev_str:<12}{ni_str:<12}{gm:<10}")
+        lines.append(f"{prefix}{short_name:<16}{signal:<12}{rev_str:<12}{ni_str:<12}{gm:<10}")
     
     lines.append("")
     
-    for r in results:
-        if r is None: continue
-        
-        lines.append("-" * 70)
-        lines.append(f"【{r['name']}】报告期: {r['current_date']} ({r['form']})")
-        if r.get("previous_date"):
-            lines.append(f"对比期: {r['previous_date']}")
-        lines.append("-" * 70)
-        lines.append("")
-        
-        c = r["current"]; p = r["previous"]
-        
-        lines.append("📈 【核心财务指标】")
-        lines.append("-" * 40)
-        
-        items = [
-            ("营业收入", "revenue", True),
-            ("毛利润", "gross_profit", True),
-            ("净利润", "net_income", True),
-            ("毛利率(%)", "gross_margin", False),
-            ("研发费用", "rd_expense", True),
-            ("现金及等价物", "cash", True),
-            ("每股收益($)", "eps", False),
-        ]
-        
-        for label, key, is_currency in items:
-            curr = c.get(key); prev = p.get(key) if p else None
-            if curr is None: continue
-            
-            if key == "gross_margin": curr_str = f"{curr:.1f}%"
-            elif key == "eps": curr_str = f"${curr:.2f}"
-            else: curr_str = fmt_num(curr, is_currency)
-            
-            if prev is not None:
-                change = pct_change(curr, prev)
-                if change is not None:
-                    arrow = "↑" if change > 0 else ("↓" if change < 0 else "→")
-                    if key == "gross_margin":
-                        lines.append(f"  {label}: {curr_str}  {arrow}{abs(curr - prev):.1f}pp")
-                    else:
-                        lines.append(f"  {label}: {curr_str}  {arrow}{abs(change):.1f}%")
-                    continue
-            lines.append(f"  {label}: {curr_str}")
-        
-        lines.append("")
-        lines.append("💡 【股票投资分析】")
-        lines.append("-" * 40)
-        
-        bullish, bearish = analyze_investment_signal(c, p)
-        signal, signal_desc = get_investment_summary(bullish, bearish)
-        
-        lines.append(f"  📊 综合信号: {signal}")
-        lines.append(f"  💭 解读: {signal_desc}")
-        lines.append("")
-        
-        if bullish:
-            lines.append("  🟢 利好因素:")
-            for item in bullish[:5]:
-                lines.append(f"    • {item}")
-        
-        if bearish:
-            lines.append("")
-            lines.append("  🔴 利空因素:")
-            for item in bearish[:5]:
-                lines.append(f"    • {item}")
-        
-        summary = []
-        if c.get("revenue"): summary.append(f"营收{fmt_num(c['revenue'])}")
-        if c.get("gross_margin"): summary.append(f"毛利率{c['gross_margin']:.0f}%")
-        if c.get("net_income"):
-            summary.append(f"{'净利润' if c['net_income'] > 0 else '净亏损'}{fmt_num(abs(c['net_income']))}")
-        
-        if summary:
-            lines.append(f"\n  👉 {' | '.join(summary)}")
-        lines.append("")
+    # 先展示新财报公司
+    new_results = [r for r in results if r and r["name"] in new_company_names]
+    other_results = [r for r in results if r and r["name"] not in new_company_names]
     
+    if new_results:
+        lines.append("=" * 70)
+        lines.append("🆕 新财报详细分析")
+        lines.append("=" * 70)
+        lines.append("")
+        
+        for r in new_results:
+            lines += build_company_section(r, True)
+    
+    # 其他公司
+    if other_results:
+        lines.append("=" * 70)
+        lines.append("其他公司概览")
+        lines.append("=" * 70)
+        lines.append("")
+        
+        for r in other_results:
+            lines += build_company_section(r, False)
+    
+    # 整体市场分析
     lines.append("=" * 70)
     lines.append("📊 【整体市场分析】")
     lines.append("=" * 70)
@@ -443,6 +498,7 @@ def build_report(results):
     lines.append(f"  📈 利好信号: {bull_count} 家")
     lines.append(f"  📉 利空信号: {bear_count} 家")
     lines.append(f"  ⚖️ 中性信号: {neutral_count} 家")
+    lines.append(f"  🆕 新财报: {len(new_filings)} 家")
     lines.append(f"")
     
     if bull_count > bear_count * 2:
@@ -462,6 +518,86 @@ def build_report(results):
     lines.append("数据来源: SEC EDGAR | 报告类型: 10-K/10-Q/20-F")
     lines.append("=" * 70)
     return "\n".join(lines)
+
+
+def build_company_section(r, is_new):
+    lines = []
+    lines.append("-" * 70)
+    
+    prefix = "🆕 " if is_new else ""
+    lines.append(f"{prefix}【{r['name']}】报告期: {r['current_date']} ({r['form']})")
+    if r.get("previous_date"):
+        lines.append(f"对比期: {r['previous_date']}")
+    lines.append("-" * 70)
+    lines.append("")
+    
+    c = r["current"]; p = r["previous"]
+    
+    lines.append("📈 【核心财务指标】")
+    lines.append("-" * 40)
+    
+    items = [
+        ("营业收入", "revenue", True),
+        ("毛利润", "gross_profit", True),
+        ("净利润", "net_income", True),
+        ("毛利率(%)", "gross_margin", False),
+        ("研发费用", "rd_expense", True),
+        ("现金及等价物", "cash", True),
+        ("每股收益($)", "eps", False),
+    ]
+    
+    for label, key, is_currency in items:
+        curr = c.get(key); prev = p.get(key) if p else None
+        if curr is None: continue
+        
+        if key == "gross_margin": curr_str = f"{curr:.1f}%"
+        elif key == "eps": curr_str = f"${curr:.2f}"
+        else: curr_str = fmt_num(curr, is_currency)
+        
+        if prev is not None:
+            change = pct_change(curr, prev)
+            if change is not None:
+                arrow = "↑" if change > 0 else ("↓" if change < 0 else "→")
+                if key == "gross_margin":
+                    lines.append(f"  {label}: {curr_str}  {arrow}{abs(curr - prev):.1f}pp")
+                else:
+                    lines.append(f"  {label}: {curr_str}  {arrow}{abs(change):.1f}%")
+                continue
+        lines.append(f"  {label}: {curr_str}")
+    
+    lines.append("")
+    lines.append("💡 【股票投资分析】")
+    lines.append("-" * 40)
+    
+    bullish, bearish = analyze_investment_signal(c, p)
+    signal, signal_desc = get_investment_summary(bullish, bearish)
+    
+    lines.append(f"  📊 综合信号: {signal}")
+    lines.append(f"  💭 解读: {signal_desc}")
+    lines.append("")
+    
+    if bullish:
+        lines.append("  🟢 利好因素:")
+        for item in bullish[:5]:
+            lines.append(f"    • {item}")
+    
+    if bearish:
+        lines.append("")
+        lines.append("  🔴 利空因素:")
+        for item in bearish[:5]:
+            lines.append(f"    • {item}")
+    
+    summary = []
+    if c.get("revenue"): summary.append(f"营收{fmt_num(c['revenue'])}")
+    if c.get("gross_margin"): summary.append(f"毛利率{c['gross_margin']:.0f}%")
+    if c.get("net_income"):
+        summary.append(f"{'净利润' if c['net_income'] > 0 else '净亏损'}{fmt_num(abs(c['net_income']))}")
+    
+    if summary:
+        lines.append(f"\n  👉 {' | '.join(summary)}")
+    lines.append("")
+    
+    return lines
 
 
 def send_email(subject, content, recipient):
@@ -485,9 +621,23 @@ def send_email(subject, content, recipient):
 
 
 def main():
-    print(f"[{datetime.now().isoformat()}] 开始抓取 {len(COMPANIES)} 家公司财报...")
+    print(f"[{datetime.now().isoformat()}] 开始检查 {len(COMPANIES)} 家公司财报...")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
+    # 检查新财报
+    new_filings, _ = check_new_filings()
+    
+    if not new_filings and not FORCE_SEND:
+        print(f"\nℹ️ 没有新财报，跳过发送邮件")
+        print(f"   如需强制发送，请设置 FORCE_SEND=true")
+        return
+    
+    if new_filings:
+        print(f"\n✅ 发现 {len(new_filings)} 家公司新财报！")
+    else:
+        print(f"\nℹ️ 强制发送模式 (FORCE_SEND=true)")
+    
+    # 获取所有公司的详细分析
     results = []
     for name, cik in COMPANIES:
         try:
@@ -497,14 +647,19 @@ def main():
             results.append(None)
         _time.sleep(0.2)
     
-    report = build_report([r for r in results if r is not None])
+    report = build_report([r for r in results if r is not None], new_filings)
     print("\n" + report + "\n")
     
-    report_file = os.path.join(OUTPUT_DIR, f"multi_company_{datetime.now().strftime('%Y%m%d')}.txt")
+    report_file = os.path.join(OUTPUT_DIR, f"report_{datetime.now().strftime('%Y%m%d')}.txt")
     with open(report_file, "w", encoding="utf-8") as f:
         f.write(report)
     
-    subject = f"【美股财报报告】{datetime.now().strftime('%Y-%m-%d')} 科技巨头财务+投资分析"
+    if new_filings:
+        new_names = ",".join(nf["name"].split(" ")[0] for nf in new_filings[:3])
+        subject = f"🆕【新财报】{new_names}等{len(new_filings)}家公司发布新财报 - {datetime.now().strftime('%Y-%m-%d')}"
+    else:
+        subject = f"【美股财报报告】{datetime.now().strftime('%Y-%m-%d')} 科技巨头财务+投资分析"
+    
     print(f"发送邮件至 {RECIPIENT}...")
     success, error = send_email(subject, report, RECIPIENT)
     if success: print("✅ 报告已发送")

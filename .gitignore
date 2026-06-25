@@ -1,0 +1,10 @@
+# 报告输出目录（除了状态文件）
+sec_filings/*.txt
+sec_filings/*.htm
+sec_filings/*.html
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/

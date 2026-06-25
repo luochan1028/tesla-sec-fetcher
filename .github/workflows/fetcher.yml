@@ -2,7 +2,7 @@ name: Tesla SEC Fetcher
 
 on:
   schedule:
-    - cron: '0 9 * * 1'
+    - cron: '0 14 * * *'
   workflow_dispatch:
 
 jobs:
@@ -12,6 +12,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -24,12 +26,23 @@ jobs:
           pip install requests
 
       - name: Run fetcher
+        id: fetcher
         env:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           RECIPIENT: ${{ secrets.RECIPIENT }}
+          FORCE_SEND: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
         run: |
           python tesla/sec_tesla_fetcher.py
+
+      - name: Commit state file
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add sec_filings/last_state.json 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "Update SEC filing state"
+          git push origin main 2>/dev/null || echo "Push skipped (no changes or no permission)"
 
       - name: Save downloaded files
         if: always()
